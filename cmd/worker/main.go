@@ -1,6 +1,9 @@
 // Worker is a reference Go implementation of the crawlerv3 worker protocol.
 //
-// Loop: reserve → fetch each URL → push result (multipart) or fail.
+// Streaming pipeline: a single reserver feeds a buffered channel; N fetcher
+// goroutines pull jobs and push results. A slow fetch never stalls free slots
+// — the reserver keeps the channel topped up as soon as a worker drains one.
+//
 // HTML responses are scanned for <a href> and <base href> to populate
 // discovered_links sent back to the registry.
 package main
@@ -91,12 +94,14 @@ type resultMeta struct {
 }
 
 func runLoop(ctx context.Context, cmd *cli.Command) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-stop
-		slog.Info("stopping")
-		os.Exit(0)
+		slog.Info("stopping (signal)")
+		cancel()
 	}()
 
 	registry := strings.TrimRight(cmd.String("registry"), "/")
@@ -106,6 +111,9 @@ func runLoop(ctx context.Context, cmd *cli.Command) error {
 	if conc < 1 {
 		conc = 1
 	}
+	if batch < conc {
+		batch = conc
+	}
 	idle := cmd.Duration("idle-sleep")
 	fetchTO := cmd.Duration("fetch-timeout")
 	ua := cmd.String("user-agent")
@@ -113,34 +121,54 @@ func runLoop(ctx context.Context, cmd *cli.Command) error {
 	httpc := &http.Client{Timeout: fetchTO}
 	apic := &http.Client{Timeout: 30 * time.Second}
 
-	sem := make(chan struct{}, conc)
-
 	slog.Info("worker started", "registry", registry, "batch", batch, "concurrency", conc, "fetch_timeout", fetchTO.String())
 
+	jobs := make(chan job, conc)
+	var wg sync.WaitGroup
+	for i := 0; i < conc; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				handleJob(ctx, httpc, apic, registry, pat, ua, j)
+			}
+		}()
+	}
+
 	for {
-		jobs, err := reserve(ctx, apic, registry, pat, batch)
+		if ctx.Err() != nil {
+			break
+		}
+		js, err := reserve(ctx, apic, registry, pat, batch)
 		if err != nil {
 			slog.Error("reserve", "err", err)
-			time.Sleep(idle)
+			sleep(ctx, idle)
 			continue
 		}
-		if len(jobs) == 0 {
+		if len(js) == 0 {
 			slog.Debug("reserve empty, idling", "sleep", idle.String())
-			time.Sleep(idle)
+			sleep(ctx, idle)
 			continue
 		}
-		slog.Info("batch reserved", "n", len(jobs))
-		var wg sync.WaitGroup
-		for _, j := range jobs {
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(j job) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				handleJob(ctx, httpc, apic, registry, pat, ua, j)
-			}(j)
+		slog.Info("batch reserved", "n", len(js))
+		for _, j := range js {
+			select {
+			case jobs <- j:
+			case <-ctx.Done():
+			}
 		}
-		wg.Wait()
+	}
+	close(jobs)
+	wg.Wait()
+	return nil
+}
+
+func sleep(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
 	}
 }
 
