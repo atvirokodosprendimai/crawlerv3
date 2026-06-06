@@ -1,12 +1,18 @@
-// embedworker is the reference external embedding worker for crawlerv3.
+// embedworker is the external embedding worker for crawlerv3.
 //
-// Loop: reserve a batch of pending chunks → embed each text → post the vector
-// back. Registry handles Qdrant upsert + collection bookkeeping.
+// Loop:
+//  1. Reserve N chunks from the registry (POST /v1/embed/reserve).
+//  2. Split into sub-batches of size --embed-batch and dispatch them
+//     round-robin across a fleet of Ollama hosts (POST /api/embed with
+//     {"model","input":[...]}). Big sub-batches keep GPUs loaded.
+//  3. Post vectors back (POST /v1/embed/result). Registry upserts into Qdrant.
 //
-// Two backends out of the box:
+// No local persistence. The registry is the source of truth.
 //
-//	--embed-url http://localhost:11434  (Ollama-style POST /api/embeddings)
-//	--extract-cmd "python3 /opt/embed.py"  (writes JSON {"embedding":[...]} to stdout, text on stdin)
+// Fleet config (at least one required):
+//
+//	--embed-url http://h1:11434 --embed-url http://h2:11434 ...   (repeatable)
+//	--embed-urls-file fleet.txt                                   (one URL per line)
 package main
 
 import (
@@ -14,14 +20,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,24 +41,29 @@ import (
 func main() {
 	cmd := &cli.Command{
 		Name:  "embedworker",
-		Usage: "external embedding worker for crawlerv3",
+		Usage: "load-balanced embedding worker for crawlerv3",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "registry", Required: true, Sources: cli.EnvVars("REGISTRY")},
 			&cli.StringFlag{Name: "pat", Required: true, Sources: cli.EnvVars("PAT")},
-			&cli.IntFlag{Name: "batch", Value: 64},
+
+			&cli.IntFlag{Name: "batch", Value: 1024,
+				Usage: "chunks per /v1/embed/reserve call"},
+			&cli.IntFlag{Name: "embed-batch", Value: 64,
+				Usage: "chunks per Ollama /api/embed call (sub-batch size)"},
+			&cli.IntFlag{Name: "max-concurrent", Value: 0,
+				Usage: "in-flight Ollama calls; 0 = len(embed-url)"},
 			&cli.DurationFlag{Name: "idle-sleep", Value: 5 * time.Second},
-			&cli.DurationFlag{Name: "max-runtime", Value: 0, Usage: "exit after this duration; 0 = run forever"},
+			&cli.DurationFlag{Name: "max-runtime", Value: 0,
+				Usage: "exit after this duration; 0 = run forever"},
 
-			// HTTP backend (Ollama-style /api/embeddings)
-			&cli.StringFlag{Name: "embed-url", Sources: cli.EnvVars("EMBED_URL"),
-				Usage: "Ollama-style server URL; mutually exclusive with --extract-cmd"},
-			&cli.StringFlag{Name: "embed-model", Value: "nomic-embed-text"},
+			&cli.StringSliceFlag{Name: "embed-url", Sources: cli.EnvVars("EMBED_URL"),
+				Usage: "Ollama base URL; repeat for fleet"},
+			&cli.StringFlag{Name: "embed-urls-file", Sources: cli.EnvVars("EMBED_URLS_FILE"),
+				Usage: "file with one Ollama base URL per line; merged with --embed-url"},
+			&cli.StringFlag{Name: "embed-model", Value: "nomic-embed-text", Sources: cli.EnvVars("EMBED_MODEL")},
 			&cli.StringFlag{Name: "embed-api-key", Sources: cli.EnvVars("EMBED_API_KEY")},
+			&cli.DurationFlag{Name: "embed-timeout", Value: 120 * time.Second},
 
-			// Shell-out backend
-			&cli.StringFlag{Name: "extract-cmd", Sources: cli.EnvVars("EXTRACT_CMD"),
-				Usage: "shell command; receives chunk text on stdin, must emit {\"embedding\":[...]} on stdout"},
-			&cli.DurationFlag{Name: "exec-timeout", Value: 60 * time.Second},
 			&cli.StringFlag{Name: "log-level", Value: "info", Sources: cli.EnvVars("LOG_LEVEL"),
 				Usage: "debug | info | warn | error"},
 		},
@@ -81,10 +94,6 @@ type reserveResp struct {
 	Chunks []embedChunk `json:"chunks"`
 }
 
-type embedder interface {
-	Embed(ctx context.Context, text string) ([]float32, error)
-}
-
 func run(ctx context.Context, cmd *cli.Command) error {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -96,30 +105,33 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		cancel()
 	}()
 
-	embedURL := cmd.String("embed-url")
-	extractCmd := cmd.String("extract-cmd")
-	if embedURL == "" && extractCmd == "" {
-		return fmt.Errorf("embedworker: one of --embed-url or --extract-cmd required")
+	urls, err := loadURLs(cmd.StringSlice("embed-url"), cmd.String("embed-urls-file"))
+	if err != nil {
+		return err
 	}
-	if embedURL != "" && extractCmd != "" {
-		return fmt.Errorf("embedworker: --embed-url and --extract-cmd are mutually exclusive")
+	if len(urls) == 0 {
+		return errors.New("embedworker: at least one --embed-url or --embed-urls-file required")
 	}
 
-	var e embedder
-	if embedURL != "" {
-		e = &httpEmbedder{
-			URL:    strings.TrimRight(embedURL, "/"),
-			Model:  cmd.String("embed-model"),
-			APIKey: cmd.String("embed-api-key"),
-			HTTP:   &http.Client{Timeout: cmd.Duration("exec-timeout")},
-		}
-	} else {
-		e = &cmdEmbedder{Cmd: extractCmd, Timeout: cmd.Duration("exec-timeout")}
+	maxConc := cmd.Int("max-concurrent")
+	if maxConc <= 0 {
+		maxConc = len(urls)
+	}
+
+	lb := &fleet{
+		urls:   urls,
+		model:  cmd.String("embed-model"),
+		apiKey: cmd.String("embed-api-key"),
+		http:   &http.Client{Timeout: cmd.Duration("embed-timeout")},
 	}
 
 	registry := strings.TrimRight(cmd.String("registry"), "/")
 	pat := cmd.String("pat")
 	batch := cmd.Int("batch")
+	embedBatch := cmd.Int("embed-batch")
+	if embedBatch <= 0 {
+		embedBatch = 64
+	}
 	idle := cmd.Duration("idle-sleep")
 	deadline := time.Time{}
 	if d := cmd.Duration("max-runtime"); d > 0 {
@@ -127,7 +139,14 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	api := &http.Client{Timeout: 60 * time.Second}
-	slog.Info("embedworker started", "registry", registry, "batch", batch)
+	slog.Info("embedworker started",
+		"registry", registry,
+		"fleet", len(urls),
+		"batch", batch,
+		"embed_batch", embedBatch,
+		"max_concurrent", maxConc,
+		"model", lb.model)
+
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -147,111 +166,179 @@ func run(ctx context.Context, cmd *cli.Command) error {
 			sleep(ctx, idle)
 			continue
 		}
+		start := time.Now()
 		slog.Info("batch reserved", "n", len(chunks))
-		results := make([]map[string]any, 0, len(chunks))
-		for _, c := range chunks {
-			vec, err := e.Embed(ctx, c.Text)
-			if err != nil {
-				results = append(results, map[string]any{
-					"chunk_id": c.ChunkID, "lease_token": c.LeaseToken,
-					"failed": true, "reason": err.Error(),
-				})
-				continue
-			}
-			results = append(results, map[string]any{
-				"chunk_id": c.ChunkID, "lease_token": c.LeaseToken,
-				"vector": vec,
-			})
-		}
+
+		results := embedFleet(ctx, lb, chunks, embedBatch, maxConc)
 		if err := postResults(ctx, api, registry, pat, results); err != nil {
 			slog.Error("post", "err", err)
-		} else {
-			slog.Info("batch done", "n", len(results))
+			continue
 		}
+		slog.Info("batch done", "n", len(results), "elapsed", time.Since(start))
 	}
 }
 
-// ---- backends ------------------------------------------------------------
+// ---- fleet ---------------------------------------------------------------
 
-type httpEmbedder struct {
-	URL, Model, APIKey string
-	HTTP               *http.Client
+type fleet struct {
+	urls   []string
+	model  string
+	apiKey string
+	http   *http.Client
+	count  uint64
 }
 
-func (h *httpEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
-	body, _ := json.Marshal(map[string]any{"model": h.Model, "prompt": text})
-	req, _ := http.NewRequestWithContext(ctx, "POST", h.URL+"/api/embeddings", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	if h.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+h.APIKey)
-	}
-	resp, err := h.HTTP.Do(req)
+func (f *fleet) pick() string {
+	n := atomic.AddUint64(&f.count, 1)
+	return f.urls[(n-1)%uint64(len(f.urls))]
+}
+
+type embedReq struct {
+	Model string   `json:"model"`
+	Input []string `json:"input"`
+}
+
+type embedResp struct {
+	Embeddings [][]float32 `json:"embeddings"`
+}
+
+func (f *fleet) embed(ctx context.Context, texts []string) ([][]float32, error) {
+	body, _ := json.Marshal(embedReq{Model: f.model, Input: texts})
+	url := f.pick() + "/api/embed"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if f.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+f.apiKey)
+	}
+	resp, err := f.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("embed-url status=%d body=%s", resp.StatusCode, string(raw))
+		return nil, fmt.Errorf("%s status=%d body=%s", url, resp.StatusCode, snip(raw, 200))
 	}
-	var out struct {
-		Embedding []float32 `json:"embedding"`
-	}
+	var out embedResp
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("embed-url decode: %w", err)
+		return nil, fmt.Errorf("%s decode: %w", url, err)
 	}
-	if len(out.Embedding) == 0 {
-		return nil, fmt.Errorf("embed-url returned empty vector")
-	}
-	return out.Embedding, nil
+	return out.Embeddings, nil
 }
 
-type cmdEmbedder struct {
-	Cmd     string
-	Timeout time.Duration
-}
+// embedFleet fans sub-batches across the fleet. On batch failure or
+// length mismatch, retries each text alone so one poisoned chunk doesn't
+// kill the whole sub-batch (vectors lost otherwise -> registry lease expires).
+func embedFleet(ctx context.Context, lb *fleet, chunks []embedChunk, subBatch, maxConc int) []map[string]any {
+	results := make([]map[string]any, len(chunks))
+	sem := make(chan struct{}, maxConc)
+	var wg sync.WaitGroup
 
-func (c *cmdEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
-	execCtx, cancel := context.WithTimeout(ctx, c.Timeout)
-	defer cancel()
-	cmd := exec.CommandContext(execCtx, "sh", "-c", c.Cmd)
-	cmd.Stdin = strings.NewReader(text)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("extract-cmd %v: %s", err, stderr.String())
-	}
-	// stdout may contain extra log lines; find the JSON line with "embedding".
-	line := jsonLineWith(stdout.Bytes(), []byte("embedding"))
-	if len(line) == 0 {
-		return nil, fmt.Errorf("extract-cmd: no JSON line with 'embedding'")
-	}
-	var out struct {
-		Embedding []float32 `json:"embedding"`
-	}
-	if err := json.Unmarshal(line, &out); err != nil {
-		return nil, fmt.Errorf("extract-cmd decode: %w", err)
-	}
-	if len(out.Embedding) == 0 {
-		return nil, fmt.Errorf("extract-cmd returned empty vector")
-	}
-	return out.Embedding, nil
-}
-
-func jsonLineWith(out, needle []byte) []byte {
-	sc := bufio.NewScanner(bytes.NewReader(out))
-	sc.Buffer(make([]byte, 1<<20), 1<<24)
-	for sc.Scan() {
-		b := sc.Bytes()
-		if bytes.Contains(b, needle) && len(b) > 0 && b[0] == '{' {
-			return append([]byte(nil), b...)
+	for i := 0; i < len(chunks); i += subBatch {
+		end := i + subBatch
+		if end > len(chunks) {
+			end = len(chunks)
 		}
+		sub := chunks[i:end]
+		offset := i
+
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(off int, sub []embedChunk) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			texts := make([]string, len(sub))
+			for j, c := range sub {
+				texts[j] = c.Text
+			}
+
+			vecs, err := lb.embed(ctx, texts)
+			if err == nil && len(vecs) == len(sub) {
+				for j, v := range vecs {
+					results[off+j] = map[string]any{
+						"chunk_id":    sub[j].ChunkID,
+						"lease_token": sub[j].LeaseToken,
+						"vector":      v,
+					}
+				}
+				return
+			}
+			if err != nil {
+				slog.Warn("sub-batch failed, retrying singly", "n", len(sub), "err", err)
+			} else {
+				slog.Warn("sub-batch length mismatch, retrying singly", "want", len(sub), "got", len(vecs))
+			}
+
+			for j, c := range sub {
+				if ctx.Err() != nil {
+					return
+				}
+				sv, serr := lb.embed(ctx, []string{c.Text})
+				if serr != nil || len(sv) == 0 || len(sv[0]) == 0 {
+					reason := "empty embedding"
+					if serr != nil {
+						reason = serr.Error()
+					}
+					results[off+j] = map[string]any{
+						"chunk_id":    c.ChunkID,
+						"lease_token": c.LeaseToken,
+						"failed":      true,
+						"reason":      reason,
+					}
+					continue
+				}
+				results[off+j] = map[string]any{
+					"chunk_id":    c.ChunkID,
+					"lease_token": c.LeaseToken,
+					"vector":      sv[0],
+				}
+			}
+		}(offset, sub)
 	}
-	return nil
+	wg.Wait()
+	return results
 }
 
-// ---- HTTP plumbing -------------------------------------------------------
+// ---- url loading ---------------------------------------------------------
+
+func loadURLs(flagURLs []string, file string) ([]string, error) {
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(flagURLs))
+	add := func(u string) {
+		u = strings.TrimSpace(strings.TrimRight(u, "/"))
+		if u == "" || strings.HasPrefix(u, "#") || seen[u] {
+			return
+		}
+		seen[u] = true
+		out = append(out, u)
+	}
+	for _, u := range flagURLs {
+		add(u)
+	}
+	if file == "" {
+		return out, nil
+	}
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", file, err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<16), 1<<20)
+	for sc.Scan() {
+		add(sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("read %s: %w", file, err)
+	}
+	return out, nil
+}
+
+// ---- registry plumbing ---------------------------------------------------
 
 func reserveBatch(ctx context.Context, c *http.Client, registry, pat string, batch int) ([]embedChunk, error) {
 	body, _ := json.Marshal(map[string]any{"batch": batch})
@@ -265,7 +352,7 @@ func reserveBatch(ctx context.Context, c *http.Client, registry, pat string, bat
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("reserve status=%d body=%s", resp.StatusCode, string(raw))
+		return nil, fmt.Errorf("reserve status=%d body=%s", resp.StatusCode, snip(raw, 200))
 	}
 	var rr reserveResp
 	if err := json.Unmarshal(raw, &rr); err != nil {
@@ -286,9 +373,9 @@ func postResults(ctx context.Context, c *http.Client, registry, pat string, resu
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("result status=%d body=%s", resp.StatusCode, string(raw))
+		return fmt.Errorf("result status=%d body=%s", resp.StatusCode, snip(raw, 200))
 	}
-	fmt.Printf("embedworker: result -> %s\n", string(raw))
+	slog.Info("result posted", "resp", snip(raw, 200))
 	return nil
 }
 
@@ -299,4 +386,11 @@ func sleep(ctx context.Context, d time.Duration) {
 	case <-ctx.Done():
 	case <-t.C:
 	}
+}
+
+func snip(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "..."
 }
