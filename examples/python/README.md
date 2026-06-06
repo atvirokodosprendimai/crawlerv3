@@ -88,5 +88,5 @@ If `POST /v1/tasks/reserve` returns `403 capability_denied`, the PAT
 was issued without the kind. Re-issue:
 
 ```bash
-registry pat-issue --label py-worker --capabilities html_to_markdown,pdf_ocr
+registry create-worker --label py-worker --capabilities html_to_markdown,pdf_ocr
 ```

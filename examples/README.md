@@ -69,7 +69,7 @@ Heartbeat only if a single task takes longer than ~30 s (lease TTL is
 | Name | Meaning |
 |---|---|
 | `REGISTRY` | Base URL, e.g. `http://localhost:8080` |
-| `PAT`      | Personal access token. Create with `registry pat-issue --label foo --capabilities pdf_ocr,docx_to_pdf` |
+| `PAT`      | Personal access token. Create with `registry create-worker --label foo --capabilities pdf_ocr,office_to_pdf` |
 | `KIND`     | Processor name(s) you can serve, comma-separated |
 
 Issue a token with the capabilities your worker needs. Mismatch → the
@@ -78,8 +78,17 @@ registry returns `403 capability_denied` at reserve time.
 ## Pick your starting point
 
 * New custom processor in Go, deployed alongside the registry → start
-  with `golang/`. You can register the kind in
-  [`internal/domain/processing/job.go`](../internal/domain/processing/job.go)
-  and add a pipeline trigger with `registry trigger-add`.
+  with `golang/`. No registry rebuild required — register the kind in
+  the catalog with `registry capability-add`, route work to it with
+  `registry trigger-add`, then issue a worker PAT with
+  `registry create-worker --capabilities <kind>`. See
+  [`../README.md#adding-a-new-processor--no-rebuild-required`](../README.md#adding-a-new-processor--no-rebuild-required).
 * Existing Python ML model → `python/`.
 * Existing Node service (Puppeteer, sharp, ffmpeg wrappers) → `nodejs/`.
+
+The `Processor` constants in
+[`internal/domain/processing/job.go`](../internal/domain/processing/job.go)
+are only identifiers for the registry binary's **in-process** workers
+(`html_strip`, `text_passthrough`). External worker kinds (everything
+above) are free-form strings — neither PAT issuance nor task reservation
+validates against a hard-coded list.

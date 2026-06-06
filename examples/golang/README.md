@@ -91,14 +91,18 @@ blobs to a stub markdown string. Replace `processHTMLToMarkdown` in
 
 ## Wiring a new processor end-to-end
 
-1. Add the constant to
-   [`internal/domain/processing/job.go`](../../internal/domain/processing/job.go):
-   ```go
-   ProcHTMLToMarkdown Processor = "html_to_markdown"
+No registry rebuild required. Kinds are free-form strings; the catalog,
+PATs, and triggers are all set from the CLI.
+
+1. *(Optional)* Register the kind in the catalog so it shows up under
+   `list-capabilities`:
+   ```bash
+   registry capability-add --name html_to_markdown \
+     --description "Convert HTML to Markdown"
    ```
 2. Issue a PAT with that capability:
    ```bash
-   registry pat-issue --label md-worker --capabilities html_to_markdown
+   registry create-worker --label md-worker --capabilities html_to_markdown
    ```
 3. Add a pipeline trigger so new HTML lake objects enqueue your kind:
    ```bash
@@ -106,6 +110,12 @@ blobs to a stub markdown string. Replace `processHTMLToMarkdown` in
      --content-type text/html --enqueue html_to_markdown
    ```
 4. Run this worker.
+
+The constants in
+[`internal/domain/processing/job.go`](../../internal/domain/processing/job.go)
+are reserved for the registry binary's in-process workers. Do **not**
+add a constant there for an external worker — it is unnecessary and
+would imply the registry serves the kind itself.
 
 ## Errors
 
