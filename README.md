@@ -1190,6 +1190,30 @@ Filter shape (`when_filter` column, JSON):
 
 Both fields are optional; missing means "any". Comparisons are case-insensitive prefix match for content type and exact for source_processor. Triggers are cached for 5s, so CLI edits propagate within at most a 5-second window.
 
+#### Adding a new processor — no rebuild required
+
+The `Processor` constants in `internal/domain/processing/job.go` are convenience identifiers for the registry binary's *in-process* workers (`html_strip`, `text_passthrough`). Nothing in the request path validates against that list. To add a new **external** processor (e.g. `video_processing` backed by ffmpeg), no registry rebuild or redeploy is needed:
+
+```bash
+# 1. Register the kind in the catalog (optional but improves `list-capabilities` output)
+registry capability-add --name video_processing \
+  --description "Transcode video lake objects to mp4"
+
+# 2. Route matching lake objects to it
+registry trigger-add --on lake_object_inserted \
+  --content-type video/ --enqueue video_processing
+
+# 3. Issue a PAT for the worker
+registry create-worker --label vid-worker --capabilities video_processing
+#    → save the printed PAT
+
+# 4. Run your ffmpeg worker (any language; see examples/) with that PAT and KIND=video_processing
+```
+
+The worker reserves jobs via `POST /v1/tasks/reserve {kinds:["video_processing"]}` and uploads the result via `POST /v1/tasks/result`. The registry binary did not change.
+
+Use `capability-add` only for catalog discoverability — it does not gate PAT issuance or task reservation, both of which accept any string. `capability-rm --name X` removes a catalog entry.
+
 ### Tasks: `/v1/tasks/*`
 
 External processing-task protocol. Same lease/reserve/result/fail shape as crawl, scoped to one or more `processor` kinds.

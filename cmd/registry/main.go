@@ -166,6 +166,14 @@ func main() {
 			{Name: "trigger-delete", Usage: "delete a trigger", Flags: []cli.Flag{
 				&cli.IntFlag{Name: "id", Required: true},
 			}, Action: actionTriggerDelete},
+			{Name: "capability-add", Usage: "register a capability in the catalog", Flags: []cli.Flag{
+				&cli.StringFlag{Name: "name", Required: true, Usage: "e.g. video_processing"},
+				&cli.StringFlag{Name: "description", Value: ""},
+				&cli.BoolFlag{Name: "internal", Value: false, Usage: "served by registry binary's in-process worker"},
+			}, Action: actionCapabilityAdd},
+			{Name: "capability-rm", Usage: "delete a capability from the catalog", Flags: []cli.Flag{
+				&cli.StringFlag{Name: "name", Required: true},
+			}, Action: actionCapabilityRm},
 		},
 	}
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
@@ -481,6 +489,26 @@ func actionListCapabilities(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 	defer db.Close()
+
+	cat, err := gormrepo.NewCapabilityRepo(db).List(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Println("CATALOG (capabilities table):")
+	if len(cat) == 0 {
+		fmt.Println("  (none)")
+	} else {
+		fmt.Printf("  %-20s  %-8s  %s\n", "NAME", "INTERNAL", "DESCRIPTION")
+		for _, c := range cat {
+			internal := "no"
+			if c.Internal {
+				internal = "yes"
+			}
+			fmt.Printf("  %-20s  %-8s  %s\n", c.Name, internal, c.Description)
+		}
+	}
+
 	ws, err := gormrepo.NewWorkerRepo(db).List(ctx)
 	if err != nil {
 		return err
@@ -494,6 +522,9 @@ func actionListCapabilities(ctx context.Context, cmd *cli.Command) error {
 	for _, c := range workerid.EndpointGatedCapabilities() {
 		delete(counts, c.Name)
 	}
+	for _, c := range cat {
+		delete(counts, c.Name)
+	}
 	names := make([]string, 0, len(counts))
 	for n := range counts {
 		names = append(names, n)
@@ -501,7 +532,7 @@ func actionListCapabilities(ctx context.Context, cmd *cli.Command) error {
 	sort.Strings(names)
 
 	fmt.Println()
-	fmt.Println("WORKER-DECLARED (from workers table):")
+	fmt.Println("WORKER-DECLARED (free-form, not in catalog):")
 	if len(names) == 0 {
 		fmt.Println("  (none)")
 		return nil
@@ -775,6 +806,38 @@ func actionSeedDomain(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 	fmt.Printf("domain_id=%d host=%s scheme=%s delay=%dms\n", d.ID, d.Host, d.Scheme, d.CrawlDelayMS)
+	return nil
+}
+
+func actionCapabilityAdd(ctx context.Context, cmd *cli.Command) error {
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	c := processing.Capability{
+		Name:        cmd.String("name"),
+		Description: cmd.String("description"),
+		Internal:    cmd.Bool("internal"),
+	}
+	if err := gormrepo.NewCapabilityRepo(db).Upsert(ctx, c); err != nil {
+		return err
+	}
+	fmt.Printf("capability=%s internal=%v description=%q\n", c.Name, c.Internal, c.Description)
+	return nil
+}
+
+func actionCapabilityRm(ctx context.Context, cmd *cli.Command) error {
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	name := cmd.String("name")
+	if err := gormrepo.NewCapabilityRepo(db).Delete(ctx, name); err != nil {
+		return err
+	}
+	fmt.Printf("deleted capability=%s\n", name)
 	return nil
 }
 
