@@ -21,6 +21,7 @@ Distributed web crawler + data lake. Central Go registry hands jobs to anonymous
    - [`worker`](#worker) — reference crawl worker
    - [`taskworker`](#taskworker) — single-kind external processing worker
    - [`ocrworker`](#ocrworker) — dedicated PDF OCR worker (mutool + gs + tesseract page-parallel)
+   - [`embedworker`](#embedworker) — load-balanced embedding worker (Ollama fleet, `/api/embed` batch)
    - [`agent`](#agent) — unified worker (crawl + multiple task kinds)
    - [`migrator`](#migrator) — local↔S3 blob mover
 6. [Configuration (env vars)](#configuration-env-vars)
@@ -116,9 +117,13 @@ Requires Go 1.25+.
 git clone https://github.com/atvirokodosprendimai/crawlerv3.git
 cd crawlerv3
 go mod download
-go build -o ./bin/registry ./cmd/registry
-go build -o ./bin/worker   ./cmd/worker
-go build -o ./bin/migrator ./cmd/migrator
+go build -o ./bin/registry    ./cmd/registry
+go build -o ./bin/worker      ./cmd/worker
+go build -o ./bin/taskworker  ./cmd/taskworker
+go build -o ./bin/ocrworker   ./cmd/ocrworker
+go build -o ./bin/embedworker ./cmd/embedworker
+go build -o ./bin/agent       ./cmd/agent
+go build -o ./bin/migrator    ./cmd/migrator
 ```
 
 SQLite uses `glebarez/sqlite` (modernc.org/sqlite under the hood), so no cgo is required.
