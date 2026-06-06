@@ -52,18 +52,6 @@ func NewPipeline(l lake.Repository, b lake.BlobStore, p processing.Repository, e
 // SetResolver wires the collection resolver for per-domain embed routing.
 func (p *Pipeline) SetResolver(r *CollectionResolver) { p.Resolver = r }
 
-// EnqueueFor inspects content type and queues the appropriate processor.
-func (p *Pipeline) EnqueueFor(ctx context.Context, lakeID int64, contentType string) {
-	switch routeFor(contentType) {
-	case processing.ProcHTMLStrip:
-		_, _ = p.Processing.Enqueue(ctx, lakeID, processing.ProcHTMLStrip)
-	case processing.ProcPDFOCR:
-		_, _ = p.Processing.Enqueue(ctx, lakeID, processing.ProcPDFOCR)
-	case processing.ProcDOCXToPDF:
-		_, _ = p.Processing.Enqueue(ctx, lakeID, processing.ProcDOCXToPDF)
-	}
-}
-
 // Run polls for queued processing_jobs and dispatches them.
 // Stops when ctx is cancelled.
 func (p *Pipeline) Run(ctx context.Context, tick time.Duration) {
@@ -259,18 +247,3 @@ func newUUID() string {
 	return string(out)
 }
 
-func routeFor(ct string) processing.Processor {
-	ct = strings.ToLower(strings.TrimSpace(ct))
-	if i := strings.Index(ct, ";"); i > 0 {
-		ct = strings.TrimSpace(ct[:i])
-	}
-	switch ct {
-	case "text/html":
-		return processing.ProcHTMLStrip
-	case "application/pdf":
-		return processing.ProcPDFOCR
-	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-		return processing.ProcDOCXToPDF
-	}
-	return ""
-}

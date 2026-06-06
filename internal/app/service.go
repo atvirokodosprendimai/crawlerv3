@@ -145,13 +145,11 @@ func (s *Service) AcceptResult(ctx context.Context, in ResultIngest) (lakeID int
 		return 0, fmt.Errorf("result: complete: %w", err)
 	}
 
-	// Routing: prefer dispatcher (declarative triggers) over legacy Pipeline.EnqueueFor.
+	// Routing: declarative triggers fire processing jobs for matching events.
 	if s.Dispatcher != nil {
 		s.Dispatcher.Fire(ctx, triggers.EvtLakeObjectInserted, EventPayload{
 			LakeObjectID: id, ContentType: in.ContentType,
 		})
-	} else if s.Pipeline != nil {
-		s.Pipeline.EnqueueFor(ctx, id, in.ContentType)
 	}
 
 	// Enqueue discovered links. Best-effort: log errors but do not fail the result.
