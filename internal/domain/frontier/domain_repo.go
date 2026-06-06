@@ -9,6 +9,7 @@ type DomainRow struct {
 	Scheme             string
 	IsActive           bool
 	CrawlDelayMS       int
+	ParallelFetches    int    // max URLs reserved per call from this domain; raise for cooperative hosts
 	EmbedCollection    string // optional override for the vector-store collection
 	RequiredCapability string // workers must have this capability to reserve URLs of this domain
 }
@@ -21,6 +22,7 @@ type DomainRepo interface {
 	List(ctx context.Context) ([]DomainRow, error)
 	SetActive(ctx context.Context, host string, active bool) error
 	UpdateCrawlDelay(ctx context.Context, host string, ms int) error
+	UpdateParallelFetches(ctx context.Context, host string, n int) error
 	UpdateScheme(ctx context.Context, host, scheme string) error
 	UpdateEmbedCollection(ctx context.Context, host, collection string) error
 	UpdateRequiredCapability(ctx context.Context, host, capability string) error

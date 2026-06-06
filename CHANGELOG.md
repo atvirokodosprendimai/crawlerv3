@@ -12,3 +12,7 @@
 - 2026-06-06 `97a4811` feat(ocrworker): PDF OCR task worker (mutool+gs+tesseract page-parallel)
 - 2026-06-06 `6fb6548` feat(fts): symmetric Stanza→Quickwit pipeline + /v1/search/fts
 - 2026-06-06 `635c6d4` feat(embedworker): load-balanced Ollama fleet with batched /api/embed
+- 2026-06-06 `2945e97` merge: README embedworker fleet docs
+- 2026-06-06 `047de8e` merge: README embedworker TOC + build list
+- 2026-06-06 `1a24d4b` merge: worker streaming pipeline
+- 2026-06-06 `21f878f` merge: multipart tempfile cleanup

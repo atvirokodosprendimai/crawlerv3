@@ -158,6 +158,8 @@ func main() {
 				&cli.StringFlag{Name: "host", Required: true},
 				&cli.StringFlag{Name: "scheme", Value: "https"},
 				&cli.IntFlag{Name: "crawl-delay-ms", Value: 1000},
+				&cli.IntFlag{Name: "parallel-fetches", Value: 1,
+					Usage: "max URLs reserved per call from this domain; raise on cooperative hosts to enable concurrent fetches"},
 			}, Action: actionSeedDomain},
 			{Name: "list-domains", Usage: "show seeded crawl targets", Action: actionListDomains},
 			{Name: "activate-domain", Usage: "set is_active=1 for a domain", Flags: []cli.Flag{
@@ -169,6 +171,7 @@ func main() {
 			{Name: "update-domain", Usage: "change a domain's settings without restart", Flags: []cli.Flag{
 				&cli.StringFlag{Name: "host", Required: true},
 				&cli.IntFlag{Name: "crawl-delay-ms", Value: -1, Usage: "-1 = leave unchanged"},
+				&cli.IntFlag{Name: "parallel-fetches", Value: -1, Usage: "-1 = leave unchanged; min 1"},
 				&cli.StringFlag{Name: "scheme", Value: "", Usage: "empty = leave unchanged"},
 				&cli.StringFlag{Name: "embed-collection", Value: "", Usage: "vector-store collection hint; '-' to clear"},
 				&cli.StringFlag{Name: "required-capability", Value: "",
@@ -862,8 +865,22 @@ func actionSeedDomain(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("domain_id=%d host=%s scheme=%s delay=%dms\n", d.ID, d.Host, d.Scheme, d.CrawlDelayMS)
+	if pf := cmd.Int("parallel-fetches"); pf > 1 {
+		if err := frepo.UpdateParallelFetches(ctx, d.Host, pf); err != nil {
+			return err
+		}
+		d.ParallelFetches = pf
+	}
+	fmt.Printf("domain_id=%d host=%s scheme=%s delay=%dms parallel=%d\n",
+		d.ID, d.Host, d.Scheme, d.CrawlDelayMS, max1(d.ParallelFetches))
 	return nil
+}
+
+func max1(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
 }
 
 func actionCapabilityAdd(ctx context.Context, cmd *cli.Command) error {
@@ -1025,8 +1042,8 @@ func actionListDomains(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%-4s  %-30s  %-8s  %8s  %-7s  %-20s  %s\n",
-		"ID", "HOST", "SCHEME", "DELAY_MS", "ACTIVE", "REQ_CAP", "EMBED_COLLECTION")
+	fmt.Printf("%-4s  %-30s  %-8s  %8s  %8s  %-7s  %-20s  %s\n",
+		"ID", "HOST", "SCHEME", "DELAY_MS", "PARALLEL", "ACTIVE", "REQ_CAP", "EMBED_COLLECTION")
 	for _, d := range ds {
 		active := "yes"
 		if !d.IsActive {
@@ -1040,8 +1057,8 @@ func actionListDomains(ctx context.Context, cmd *cli.Command) error {
 		if req == "" {
 			req = "(any)"
 		}
-		fmt.Printf("%-4d  %-30s  %-8s  %8d  %-7s  %-20s  %s\n",
-			d.ID, d.Host, d.Scheme, d.CrawlDelayMS, active, req, col)
+		fmt.Printf("%-4d  %-30s  %-8s  %8d  %8d  %-7s  %-20s  %s\n",
+			d.ID, d.Host, d.Scheme, d.CrawlDelayMS, max1(d.ParallelFetches), active, req, col)
 	}
 	return nil
 }
@@ -1060,6 +1077,12 @@ func actionUpdateDomain(ctx context.Context, cmd *cli.Command) error {
 			return err
 		}
 		changed = append(changed, fmt.Sprintf("crawl_delay_ms=%d", v))
+	}
+	if v := cmd.Int("parallel-fetches"); v >= 1 {
+		if err := r.UpdateParallelFetches(ctx, host, v); err != nil {
+			return err
+		}
+		changed = append(changed, fmt.Sprintf("parallel_fetches=%d", v))
 	}
 	if v := cmd.String("scheme"); v != "" {
 		if err := r.UpdateScheme(ctx, host, v); err != nil {

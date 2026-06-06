@@ -10,6 +10,7 @@ type Domain struct {
 	Scheme             string     `gorm:"column:scheme"`
 	IsActive           bool       `gorm:"column:is_active"`
 	CrawlDelayMS       int        `gorm:"column:crawl_delay_ms"`
+	ParallelFetches    int        `gorm:"column:parallel_fetches"`
 	RobotsBody         *string    `gorm:"column:robots_body"`
 	RobotsFetchedAt    *time.Time `gorm:"column:robots_fetched_at"`
 	LastRequestAt      *time.Time `gorm:"column:last_request_at"`

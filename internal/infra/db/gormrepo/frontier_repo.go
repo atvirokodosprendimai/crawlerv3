@@ -84,6 +84,7 @@ func mapDomain(d *Domain) *frontier.DomainRow {
 	row := &frontier.DomainRow{
 		ID: d.ID, Host: d.Host, Scheme: d.Scheme,
 		IsActive: d.IsActive, CrawlDelayMS: d.CrawlDelayMS,
+		ParallelFetches: d.ParallelFetches,
 	}
 	if d.EmbedCollection != nil {
 		row.EmbedCollection = *d.EmbedCollection
@@ -101,6 +102,25 @@ func (r *FrontierRepo) UpdateCrawlDelay(ctx context.Context, host string, ms int
 	}
 	res := r.DB.W.WithContext(ctx).Model(&Domain{}).Where("host = ?", host).
 		Update("crawl_delay_ms", ms)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errors.New("domain not found")
+	}
+	return nil
+}
+
+// UpdateParallelFetches caps how many URLs a single reserve call may pull
+// from this domain. 1 = strict serial (the default, preserves classic
+// politeness). >1 = let a cooperative host serve multiple URLs concurrently
+// per reserve; crawl_delay_ms still gates the gap between successive reserves.
+func (r *FrontierRepo) UpdateParallelFetches(ctx context.Context, host string, n int) error {
+	if n < 1 {
+		n = 1
+	}
+	res := r.DB.W.WithContext(ctx).Model(&Domain{}).Where("host = ?", host).
+		Update("parallel_fetches", n)
 	if res.Error != nil {
 		return res.Error
 	}
@@ -255,9 +275,13 @@ func (r *FrontierRepo) Reserve(
 	args = append(args, batch)
 
 	err := r.DB.WriteTX(ctx, func(tx *rwdb.Tx) error {
+		// rn <= pf lets cooperative hosts (parallel_fetches > 1) ship multiple
+		// URLs per reserve call. Default parallel_fetches=1 preserves classic
+		// one-at-a-time politeness. crawl_delay_ms still gates the gap between
+		// successive reserves of the same domain via politenessExpr.
 		pickSQL := fmt.Sprintf(`
 SELECT url_hash, domain_id FROM (
-  SELECT cf.url_hash, cf.domain_id,
+  SELECT cf.url_hash, cf.domain_id, d.parallel_fetches AS pf,
          ROW_NUMBER() OVER (PARTITION BY cf.domain_id ORDER BY cf.priority DESC, cf.scheduled_for ASC) AS rn
   FROM crawl_frontier cf
   JOIN domains d ON d.id = cf.domain_id
@@ -266,7 +290,7 @@ SELECT url_hash, domain_id FROM (
     AND (cf.next_retry_at IS NULL OR cf.next_retry_at <= ?)
     AND d.is_active = 1
     AND %s%s
-) ranked WHERE rn = 1 LIMIT ?`, politenessExpr, capFilter)
+) ranked WHERE rn <= pf LIMIT ?`, politenessExpr, capFilter)
 
 		type pickRow struct {
 			URLHash  []byte `gorm:"column:url_hash"`
@@ -280,6 +304,7 @@ SELECT url_hash, domain_id FROM (
 			return nil
 		}
 
+		touched := make(map[int64]bool, len(picks))
 		for _, p := range picks {
 			tok, raw := signLease(p.URLHash, expires)
 			res := tx.Exec(`
@@ -297,8 +322,11 @@ UPDATE crawl_frontier
 			if res.RowsAffected == 0 {
 				continue
 			}
-			if err := tx.Exec(`UPDATE domains SET last_request_at = ? WHERE id = ?`, now, p.DomainID).Error; err != nil {
-				return fmt.Errorf("reserve: touch domain: %w", err)
+			if !touched[p.DomainID] {
+				if err := tx.Exec(`UPDATE domains SET last_request_at = ? WHERE id = ?`, now, p.DomainID).Error; err != nil {
+					return fmt.Errorf("reserve: touch domain: %w", err)
+				}
+				touched[p.DomainID] = true
 			}
 			var m Frontier
 			if err := tx.Where("url_hash = ?", p.URLHash).First(&m).Error; err != nil {

@@ -264,17 +264,20 @@ registry unban-worker --id 5
 #### Crawl frontier
 
 ```bash
-# Register a domain (politeness delay defaults to 1000ms).
+# Register a domain (politeness delay defaults to 1000ms, parallel_fetches=1).
 # IMPORTANT: only URLs whose host is in this `domains` table will ever be
 # crawled. Discovered links to external hosts are dropped by default.
 registry seed-domain --host example.com --crawl-delay-ms 1000
 registry seed-domain --host slow.example.org --scheme https --crawl-delay-ms 5000
+# Cooperative host? Let reserve hand out multiple URLs at once:
+registry seed-domain --host own.example.net --crawl-delay-ms 100 --parallel-fetches 16
 
-# Inspect the scope (now also shows per-domain embed_collection override)
+# Inspect the scope (shows crawl_delay_ms + parallel_fetches + embed_collection)
 registry list-domains
-# ID  HOST                  SCHEME  DELAY_MS  ACTIVE  EMBED_COLLECTION
-# 1   example.com           https       1000  yes     (host)
-# 2   slow.example.org      https       5000  yes     (host)
+# ID  HOST                  SCHEME  DELAY_MS  PARALLEL  ACTIVE  REQ_CAP  EMBED_COLLECTION
+# 1   example.com           https       1000         1  yes     (any)    (host)
+# 2   slow.example.org      https       5000         1  yes     (any)    (host)
+# 3   own.example.net       https        100        16  yes     (any)    (host)
 
 registry deactivate-domain --host slow.example.org   # stops reserves + drops new discoveries
 registry activate-domain   --host slow.example.org
@@ -577,7 +580,19 @@ worker \
 | `--fetch-timeout` | `30s` | Per-URL HTTP `GET` deadline. Raise for slow/heavy pages (PDFs, large HTML); below the **60s lease TTL** to avoid heartbeats. |
 | `--user-agent` | `crawlerv3-worker/0.1` | UA sent on outbound fetches. Override for branding, contact info (some sites require it), or to match a real browser fingerprint. |
 
-> **Throughput note.** Per-domain politeness is enforced by the registry, not the worker: the reserve query returns at most one URL per domain per `crawl_delay_ms` window (default **1000ms**). A single-domain crawl with the default delay caps at ~1 fetch/sec regardless of `--concurrency`. To go faster: drop the delay (`registry update-domain --host X --crawl-delay-ms 100`) or crawl multiple domains in parallel.
+> **Throughput note.** Per-domain politeness is enforced by the registry, not the worker. Two knobs on each `domains` row control the rate:
+>
+> - `crawl_delay_ms` (default **1000ms**) — minimum gap between successive **reserves** of the same domain.
+> - `parallel_fetches` (default **1**) — maximum URLs returned per reserve call from the same domain.
+>
+> Effective peak rate from one domain ≈ `parallel_fetches / crawl_delay_ms` URLs/sec. With the defaults that's **1 fetch/sec** — `--concurrency` on the worker can't help, because reserve only ever returns one job. To scale a single-domain crawl on a cooperative host:
+>
+> ```bash
+> registry update-domain --host X --crawl-delay-ms 100 --parallel-fetches 16
+> # → up to 16 URLs in flight per 100ms ≈ 160 URLs/sec
+> ```
+>
+> Or just crawl many domains in parallel — each gets its own bucket so parallelism comes for free.
 
 ### `taskworker`
 
