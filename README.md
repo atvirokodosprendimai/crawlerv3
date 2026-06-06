@@ -554,13 +554,14 @@ Trigger evaluation:
 
 ### `worker`
 
-Reference crawl worker (reserve → fetch → push). PAT-authenticated.
+Reference crawl worker. Streaming pipeline: a single reserver feeds a buffered channel; `--concurrency` fetcher goroutines pull jobs and push results in parallel. A slow page never stalls free slots — the reserver tops up the channel as soon as a worker drains one. PAT-authenticated.
 
 ```
 worker \
   --registry      http://localhost:8080  (REGISTRY)
   --pat           <PAT>                  (PAT)
   --batch         10
+  --concurrency   4
   --idle-sleep    3s
   --fetch-timeout 30s
   --user-agent    crawlerv3-worker/0.1
@@ -570,10 +571,13 @@ worker \
 |---|---|---|
 | `--registry` (`REGISTRY`) | — *(required)* | Base URL of registry, no trailing slash (`http://host:8080`). |
 | `--pat` (`PAT`) | — *(required)* | PAT issued by `registry create-worker --capabilities crawl,...`. Must include the `crawl` endpoint-gated cap. |
-| `--batch` | `10` | Jobs reserved per `/v1/jobs/reserve` call. Raise on fast networks / lots of small pages; lower (1–4) on slow/large pages so heartbeats don't stack up. Server caps it at registered `max_concurrent`. |
+| `--batch` | `10` | Jobs reserved per `/v1/jobs/reserve` call. Raise on fast networks / lots of small pages; lower (1–4) on slow/large pages so heartbeats don't stack up. Server caps it at registered `max_concurrent`. Floored to `--concurrency` so the pipeline always has slots to fill. |
+| `--concurrency` | `4` | Parallel in-flight fetches. Channel buffer is sized to this. Independent of `--batch`: with `concurrency=8 batch=2` the reserver tops up frequently in small chunks; with `concurrency=4 batch=32` it reserves rarely but keeps a long backlog. |
 | `--idle-sleep` | `3s` | Wait between empty reserves. Tune up on a quiet frontier to reduce registry load; tune down (≤1s) during a burst to keep CPUs fed. |
 | `--fetch-timeout` | `30s` | Per-URL HTTP `GET` deadline. Raise for slow/heavy pages (PDFs, large HTML); below the **60s lease TTL** to avoid heartbeats. |
 | `--user-agent` | `crawlerv3-worker/0.1` | UA sent on outbound fetches. Override for branding, contact info (some sites require it), or to match a real browser fingerprint. |
+
+> **Throughput note.** Per-domain politeness is enforced by the registry, not the worker: the reserve query returns at most one URL per domain per `crawl_delay_ms` window (default **1000ms**). A single-domain crawl with the default delay caps at ~1 fetch/sec regardless of `--concurrency`. To go faster: drop the delay (`registry update-domain --host X --crawl-delay-ms 100`) or crawl multiple domains in parallel.
 
 ### `taskworker`
 
