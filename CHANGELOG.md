@@ -6,3 +6,4 @@
 - 2026-06-06 `fdabed8` chore: changelog entry for examples commit
 - 2026-06-06 `986871d` slice 13: db capabilities catalog
 - 2026-06-06 `6e1a445` cleanup: drop legacy Pipeline.EnqueueFor routing
+- 2026-06-06 `c2c236c` examples: refresh CLI commands for slice 13 catalog

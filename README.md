@@ -557,6 +557,15 @@ worker \
   --user-agent    crawlerv3-worker/0.1
 ```
 
+| Flag (env) | Default | When to use |
+|---|---|---|
+| `--registry` (`REGISTRY`) | — *(required)* | Base URL of registry, no trailing slash (`http://host:8080`). |
+| `--pat` (`PAT`) | — *(required)* | PAT issued by `registry create-worker --capabilities crawl,...`. Must include the `crawl` endpoint-gated cap. |
+| `--batch` | `10` | Jobs reserved per `/v1/jobs/reserve` call. Raise on fast networks / lots of small pages; lower (1–4) on slow/large pages so heartbeats don't stack up. Server caps it at registered `max_concurrent`. |
+| `--idle-sleep` | `3s` | Wait between empty reserves. Tune up on a quiet frontier to reduce registry load; tune down (≤1s) during a burst to keep CPUs fed. |
+| `--fetch-timeout` | `30s` | Per-URL HTTP `GET` deadline. Raise for slow/heavy pages (PDFs, large HTML); below the **60s lease TTL** to avoid heartbeats. |
+| `--user-agent` | `crawlerv3-worker/0.1` | UA sent on outbound fetches. Override for branding, contact info (some sites require it), or to match a real browser fingerprint. |
+
 ### `taskworker`
 
 Reference external processing worker for a **single** `processing_jobs` kind. Downloads the source blob, shells out to a user-configured command, posts result back. PAT-authenticated.
@@ -576,6 +585,21 @@ taskworker \
   --next-processor      pdf_ocr               # blob mode chains to next stage
   --exec-timeout        5m
 ```
+
+| Flag (env) | Default | When to use |
+|---|---|---|
+| `--registry` (`REGISTRY`) | — *(required)* | Registry base URL. |
+| `--pat` (`PAT`) | — *(required)* | Issued via `create-worker --capabilities <kind>`. |
+| `--kind` | — *(required, repeatable)* | One or more `processing_jobs.processor` names this worker claims (e.g. `pdf_ocr`, `docx_to_pdf`). Worker's `capabilities` must contain each kind. Reserve query filters server-side. |
+| `--batch` | `4` | Tasks per reserve. Heavy work (OCR, transcoding) → keep low so one box's stuck task doesn't starve the rest. Light shell-outs can raise to 16+. |
+| `--idle-sleep` | `5s` | Sleep when queue empty. Same trade-off as `worker --idle-sleep`. |
+| `--max-runtime` | `0` (forever) | Exit cleanly after this duration. Use for cron / k8s CronJob burst patterns (cheap spot GPU hours). Daemonized boxes leave at 0. |
+| `--mode` | `text` | `text` = stdout becomes `extracted_documents.text`. `blob` = first file matching `--output-glob` is uploaded as a new lake object. Pick `blob` when the processor produces a file (DOCX→PDF, video transcode). |
+| `--extract-cmd` | — *(required)* | Shell command. Placeholders: `{input}` (downloaded blob path), `{outdir}` (empty scratch dir). Examples: `"tesseract {input} - -l eng+lit"`, `"libreoffice --headless --convert-to pdf --outdir {outdir} {input}"`. |
+| `--output-glob` | `{outdir}/output.*` | Blob mode: glob used to find produced file. Tighten when extract-cmd writes multiple files (e.g. `"{outdir}/*.pdf"`). Unused in text mode. |
+| `--output-content-type` | `application/octet-stream` | Blob mode: MIME stamped on the new lake object. Required to be honest — downstream triggers fire on this. |
+| `--next-processor` | `""` | Blob mode chain: after upload, enqueue another processor on the output blob (e.g. `docx_to_pdf` → `pdf_ocr`). Empty = no chain (triggers may still fire). |
+| `--exec-timeout` | `5m` | Kill `extract-cmd` after this. Set above your slowest realistic run (OCR on a 200-page scan can take >5m on CPU). |
 
 Two examples:
 
@@ -623,6 +647,25 @@ agent \
   --next-processor.docx_to_pdf "pdf_ocr"
 ```
 
+| Flag (env) | Default | When to use |
+|---|---|---|
+| `--registry` (`REGISTRY`) | — *(required)* | Registry base URL. |
+| `--pat` (`PAT`) | — *(required)* | Single PAT covering every `--enable` kind. Worker row's `capabilities` must list each. |
+| `--enable` | — *(required)* | Comma-separated kinds: `crawl`, any task processor (`pdf_ocr`, `docx_to_pdf`, …), or `embed`. Drives which inner loops start. Pick when one box has spare CPU/RAM for several roles instead of running 3 processes. |
+| `--batch` | `4` | Per-loop reserve size (shared shape across crawl/task/embed loops). Conservative default since task work can be slow. |
+| `--idle-sleep` | `5s` | Wait between empty reserves on each loop. |
+| `--fetch-timeout` | `30s` | Crawl loop only — per-URL HTTP timeout. |
+| `--user-agent` | `crawlerv3-agent/0.1` | Crawl loop only. |
+| `--exec-timeout` | `5m` | Task + embed shell-out kill. Applies to every per-kind `--extract-cmd`. |
+| `--extract-cmd.<kind>` | — | Per-kind shell command (same `{input}`/`{outdir}` placeholders as `taskworker`). |
+| `--mode.<kind>` | `text` | Per-kind `text` or `blob`. |
+| `--output-glob.<kind>` | `{outdir}/output.*` | Per-kind blob-mode glob. |
+| `--output-content-type.<kind>` | `application/octet-stream` | Per-kind blob-mode MIME. |
+| `--next-processor.<kind>` | `""` | Per-kind blob-mode chain. |
+| `--embed-url` (`EMBED_URL`) | — | Used when `--enable` includes `embed`. Ollama-style `/api/embeddings` URL. Mutually exclusive with shell-out. |
+| `--embed-model` | `nomic-embed-text` | Model name passed in the embed request body. |
+| `--embed-api-key` (`EMBED_API_KEY`) | — | Bearer token for `--embed-url` if the server gates it. |
+
 Real-world example — one binary for a multi-purpose box:
 
 ```bash
@@ -669,6 +712,19 @@ embedworker \
   --exec-timeout    60s
 ```
 
+| Flag (env) | Default | When to use |
+|---|---|---|
+| `--registry` (`REGISTRY`) | — *(required)* | Registry base URL. |
+| `--pat` (`PAT`) | — *(required)* | Worker must have the `embed` capability. |
+| `--batch` | `64` | Chunks per `/v1/embed/reserve`. Higher = fewer round-trips; lower = faster failure recovery if the model crashes. Tune to your GPU's effective batch limit. |
+| `--idle-sleep` | `5s` | Sleep between empty reserves. |
+| `--max-runtime` | `0` (forever) | Burst pattern: spot GPU draining queue in a cron window. |
+| `--embed-url` (`EMBED_URL`) | — | **Backend A.** Ollama / LocalAI / llama.cpp-server base URL. Worker POSTs to `{url}/api/embeddings`. Pick when you already run a model server. |
+| `--embed-model` | `nomic-embed-text` | Model name in the request body. Must match a model the server has loaded. |
+| `--embed-api-key` (`EMBED_API_KEY`) | — | Optional Bearer for hosted Ollama/OpenAI-compatible endpoints. |
+| `--extract-cmd` (`EXTRACT_CMD`) | — | **Backend B.** Shell command — stdin = chunk text, stdout = JSON `{"embedding":[...]}`. Pick when you want a custom Python wrapper or no HTTP layer. Mutually exclusive with `--embed-url`. |
+| `--exec-timeout` | `60s` | Backend-B kill. Raise for large models / cold-start latency. |
+
 GPU box typical setup:
 
 ```bash
@@ -711,6 +767,23 @@ migrator \
 ```
 
 `--from` and `--to` accept `local | s3`. Already-migrated rows (whose `storage_backend` already matches `--to`) are skipped, so the run is idempotent.
+
+| Flag (env) | Default | When to use |
+|---|---|---|
+| `--db-driver` (`DB_DRIVER`) | `sqlite` | Same as registry — must point at the same DB the registry uses. |
+| `--db-dsn` (`DB_DSN`) | `crawler.db` | DSN for that DB. |
+| `--read-dsn` (`READ_DSN`) | — | Optional read-replica DSN for the scan query. |
+| `--from` | — *(required)* | Source backend: `local` or `s3`. Reads existing blob bytes from here. |
+| `--to` | — *(required)* | Destination backend: `local` or `s3`. Writes copies here, then updates `lake_objects.storage_backend`. |
+| `--local-root` (`BLOBS_ROOT`) | `./blobs` | Filesystem root when `local` is involved (either side). Must match the registry's `--blobs-root`. |
+| `--s3-bucket` (`S3_BUCKET`) | — | Required when either side is `s3`. |
+| `--s3-region` (`S3_REGION`) | — | AWS region; ignored by MinIO but the SDK still requires a value. |
+| `--s3-endpoint` (`S3_ENDPOINT`) | — | Override for MinIO / Cloudflare R2 / Wasabi. Leave empty for real AWS. |
+| `--s3-access-key` (`S3_ACCESS_KEY`) | — | Static key. Omit to fall back to AWS default chain (env, IAM role, `~/.aws/`). |
+| `--s3-secret-key` (`S3_SECRET_KEY`) | — | Static secret, same rule. |
+| `--s3-path-style` (`S3_PATH_STYLE`) | `false` | Force path-style addressing. **Required by MinIO**; harmless for AWS. |
+| `--batch` | `100` | Rows scanned per page. Lower for huge blobs (memory); higher for many small ones. |
+| `--delete-src` | `false` | **Destructive.** Removes the source blob after the copy succeeds + verifies. Always do a dry run first (`--delete-src` off), then re-run with it on. |
 
 ---
 
