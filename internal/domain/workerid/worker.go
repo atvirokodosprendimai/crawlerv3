@@ -4,6 +4,29 @@ package workerid
 
 import "time"
 
+// Capability is a named permission grantable to a Worker.
+// Only endpoint-gated capabilities live here — these gate fixed registry routes
+// and the HTTP handlers reference them by literal string.
+// Processor kinds (pdf_ocr, html_strip, etc.) and tenant tags (e.g. vvtat)
+// are NOT endpoint-gated; they flow through tasks.go which matches any string
+// against worker capabilities. Discover those by querying the workers table.
+type Capability struct {
+	Name        string
+	Group       string // "reserve" | "read"
+	Description string
+}
+
+// EndpointGatedCapabilities lists capabilities hardcoded into registry HTTP handlers.
+func EndpointGatedCapabilities() []Capability {
+	return []Capability{
+		{Name: "crawl", Group: "reserve", Description: "POST /v1/jobs/reserve — fetch crawl frontier jobs"},
+		{Name: "embed", Group: "reserve", Description: "embed endpoint — reserve embedding work"},
+		{Name: "lake_read", Group: "read", Description: "read raw lake objects"},
+		{Name: "extracted_read", Group: "read", Description: "read extracted content"},
+		{Name: "chunks_read", Group: "read", Description: "read document chunks"},
+	}
+}
+
 // Worker is a PAT-bound external participant.
 type Worker struct {
 	ID              int64

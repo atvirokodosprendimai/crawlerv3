@@ -88,6 +88,7 @@ func main() {
 				&cli.IntFlag{Name: "max-concurrent", Value: 4},
 			}, Action: actionCreateWorker},
 			{Name: "list-workers", Usage: "show pool state", Action: actionListWorkers},
+			{Name: "list-capabilities", Usage: "print core capabilities recognized by the registry", Action: actionListCapabilities},
 			{Name: "update-worker", Usage: "change capabilities or concurrency", Flags: []cli.Flag{
 				&cli.IntFlag{Name: "id", Required: true},
 				&cli.StringSliceFlag{Name: "capabilities", Usage: "replace capabilities list"},
@@ -464,6 +465,50 @@ func actionListWorkers(ctx context.Context, cmd *cli.Command) error {
 		}
 		fmt.Printf("%-4d  %-20s  %-30s  %4d  %4d  %-25s  %s\n",
 			w.ID, w.Label, caps, w.MaxConcurrent, held, seen, banned)
+	}
+	return nil
+}
+
+func actionListCapabilities(ctx context.Context, cmd *cli.Command) error {
+	fmt.Println("ENDPOINT-GATED (registry-defined):")
+	fmt.Printf("  %-18s  %-8s  %s\n", "NAME", "GROUP", "DESCRIPTION")
+	for _, c := range workerid.EndpointGatedCapabilities() {
+		fmt.Printf("  %-18s  %-8s  %s\n", c.Name, c.Group, c.Description)
+	}
+
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	ws, err := gormrepo.NewWorkerRepo(db).List(ctx)
+	if err != nil {
+		return err
+	}
+	counts := map[string]int{}
+	for _, w := range ws {
+		for _, c := range w.Capabilities {
+			counts[c]++
+		}
+	}
+	for _, c := range workerid.EndpointGatedCapabilities() {
+		delete(counts, c.Name)
+	}
+	names := make([]string, 0, len(counts))
+	for n := range counts {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	fmt.Println()
+	fmt.Println("WORKER-DECLARED (from workers table):")
+	if len(names) == 0 {
+		fmt.Println("  (none)")
+		return nil
+	}
+	fmt.Printf("  %-20s  %s\n", "NAME", "WORKERS")
+	for _, n := range names {
+		fmt.Printf("  %-20s  %d\n", n, counts[n])
 	}
 	return nil
 }

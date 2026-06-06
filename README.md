@@ -231,7 +231,19 @@ registry list-workers
 # 2   gpu-1    pdf_ocr,docx_to_pdf,embed  4    1     2026-06-05T22:30:09Z   no
 # 3   legacy   (any)                      2    0     -                      no
 
+# List capabilities the system recognizes. Endpoint-gated caps are the fixed
+# set baked into registry HTTP handlers; worker-declared caps are aggregated
+# live from the workers table (processor kinds + tenant tags).
+registry list-capabilities
+# ENDPOINT-GATED (registry-defined):
+#   crawl, embed, lake_read, extracted_read, chunks_read
+# WORKER-DECLARED (from workers table):
+#   pdf_ocr  (2 workers)
+#   vvtat    (1 worker)
+#   ...
+
 # Change a worker's permissions or cap on the fly. --max-concurrent -1 leaves it unchanged.
+# IMPORTANT: --capabilities REPLACES the list. To add a cap, pass the full new set.
 registry update-worker --id 1 --max-concurrent 12
 registry update-worker --id 2 --capabilities pdf_ocr,docx_to_pdf,embed,extracted_read
 
@@ -321,7 +333,78 @@ Notes:
 - Clear a binding with `update-domain --host X --required-capability -`.
 - The server uses the **server-stored** worker capability set, not the request body — workers cannot spoof their way into a bound domain.
 
-#### Scoping the crawl (don't let it escape)
+#### Capability model
+
+Two flavors of capability exist. They look identical on a worker row (just strings in `workers.capabilities`) but they originate in different layers:
+
+| Flavor | Defined by | Enforced at | Examples |
+|--------|-----------|-------------|----------|
+| **Endpoint-gated** | Registry HTTP handlers (hardcoded) | `wk.Can("crawl")` etc. inside `jobs.go` / `embed.go` / `reads.go` | `crawl`, `embed`, `lake_read`, `extracted_read`, `chunks_read` |
+| **Worker-declared** | Whatever string you put in `--capabilities` | `tasks.go` matches `req.Kinds[i]` against `wk.Capabilities`; reserve query matches `domains.required_capability` | `pdf_ocr`, `html_strip`, `js_render`, `vvtat`, `domain:foo.com` |
+
+The registry is a pure **orchestrator** for worker-declared caps — it doesn't know or care what `pdf_ocr` *means*. It just dispatches by string match. Adding a new processor or tenant tag requires zero registry code change.
+
+Why `wk.Can("crawl")` fails even though you set `--capabilities vvtat`:
+
+- `update-worker --capabilities vvtat` **replaces** the list (no append flag).
+- The reserve handler first checks `wk.Can("crawl")` (endpoint-gated). With caps = `["vvtat"]`, that returns false → 403 `capability_denied`.
+- Always include the endpoint-gated cap *and* the worker-declared tag: `--capabilities crawl,vvtat`.
+
+Tip: `(empty capabilities)` is a legacy backcompat that grants ALL caps. As soon as you set even one cap, the empty-list shortcut is gone — you must list every cap the worker uses.
+
+#### Adding a new processor (e.g. `video_transcode`)
+
+End-to-end recipe for a new processor kind. No registry code change is required.
+
+```bash
+# 1. Pick a kind name. It's just a string — used as workers.capabilities entry,
+#    as processing_jobs.processor, and (optionally) as a pipeline trigger output.
+KIND=video_transcode
+
+# 2. Register a trigger so new lake_objects of the right content-type auto-enqueue.
+#    (Skip this if you'll backfill or manually enqueue.)
+registry trigger-add \
+  --on lake_object_inserted \
+  --content-type video/ \
+  --enqueue "$KIND"
+
+# 3. Issue a PAT for the worker box. Include `crawl` only if the same box also crawls;
+#    for a pure transcoder, the only cap needed is the kind itself.
+registry create-worker \
+  --label gpu-video-1 \
+  --capabilities "$KIND" \
+  --max-concurrent 2
+# → pat=...   (save it)
+
+# 4. Run the worker. Two options:
+#    a) `taskworker` for a single kind (mode=blob produces a new lake object):
+./bin/taskworker \
+  --registry http://registry:8080 \
+  --pat $PAT \
+  --kind "$KIND" \
+  --mode blob \
+  --extract-cmd "ffmpeg -i {input} -c:v libx264 -preset fast {outdir}/output.mp4" \
+  --output-glob "{outdir}/*.mp4"
+
+#    b) `agent` if this box also handles other kinds — pass per-kind flags
+#       (see the `agent` section above for the --<flag>.<kind> shape).
+
+# 5. (Optional) Backfill existing rows.
+registry reprocess --processor "$KIND" --content-type-prefix video/
+
+# 6. Verify.
+registry list-capabilities    # video_transcode now appears under WORKER-DECLARED
+registry queue-stats          # PROCESSING_JOBS section shows the new processor's counts
+```
+
+What the registry does behind the scenes:
+
+- Trigger fires on insert of a `video/*` blob → row added to `processing_jobs` with `processor='video_transcode'`.
+- Worker calls `POST /v1/tasks/reserve` with `kinds=["video_transcode"]`.
+- Handler: `wk.Can("video_transcode")` matches (worker has that cap) → leases a row.
+- Worker runs `extract-cmd`, posts result via `POST /v1/tasks/result`. Output blob lands in the lake, can fire its own triggers.
+
+Same shape works for any new kind — `image_resize`, `pii_redact`, `lang_detect`, whatever. The registry stays untouched.
 
 By default the crawler is **scope-locked to seeded hosts**:
 
