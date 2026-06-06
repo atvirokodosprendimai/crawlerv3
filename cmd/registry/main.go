@@ -136,6 +136,8 @@ func main() {
 				&cli.IntFlag{Name: "crawl-delay-ms", Value: -1, Usage: "-1 = leave unchanged"},
 				&cli.StringFlag{Name: "scheme", Value: "", Usage: "empty = leave unchanged"},
 				&cli.StringFlag{Name: "embed-collection", Value: "", Usage: "vector-store collection hint; '-' to clear"},
+				&cli.StringFlag{Name: "required-capability", Value: "",
+					Usage: "bind this domain to workers with this capability (e.g. js_render, domain:foo.com); '-' to clear"},
 			}, Action: actionUpdateDomain},
 			{Name: "enqueue", Usage: "add a URL to the frontier", Flags: []cli.Flag{
 				&cli.StringFlag{Name: "url", Required: true},
@@ -858,8 +860,8 @@ func actionListDomains(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%-4s  %-40s  %-8s  %8s  %-7s  %s\n",
-		"ID", "HOST", "SCHEME", "DELAY_MS", "ACTIVE", "EMBED_COLLECTION")
+	fmt.Printf("%-4s  %-30s  %-8s  %8s  %-7s  %-20s  %s\n",
+		"ID", "HOST", "SCHEME", "DELAY_MS", "ACTIVE", "REQ_CAP", "EMBED_COLLECTION")
 	for _, d := range ds {
 		active := "yes"
 		if !d.IsActive {
@@ -869,8 +871,12 @@ func actionListDomains(ctx context.Context, cmd *cli.Command) error {
 		if col == "" {
 			col = "(host)"
 		}
-		fmt.Printf("%-4d  %-40s  %-8s  %8d  %-7s  %s\n",
-			d.ID, d.Host, d.Scheme, d.CrawlDelayMS, active, col)
+		req := d.RequiredCapability
+		if req == "" {
+			req = "(any)"
+		}
+		fmt.Printf("%-4d  %-30s  %-8s  %8d  %-7s  %-20s  %s\n",
+			d.ID, d.Host, d.Scheme, d.CrawlDelayMS, active, req, col)
 	}
 	return nil
 }
@@ -908,6 +914,20 @@ func actionUpdateDomain(ctx context.Context, cmd *cli.Command) error {
 			changed = append(changed, "embed_collection=(cleared)")
 		} else {
 			changed = append(changed, fmt.Sprintf("embed_collection=%s", actual))
+		}
+	}
+	if v := cmd.String("required-capability"); v != "" {
+		actual := v
+		if v == "-" {
+			actual = ""
+		}
+		if err := r.UpdateRequiredCapability(ctx, host, actual); err != nil {
+			return err
+		}
+		if actual == "" {
+			changed = append(changed, "required_capability=(cleared)")
+		} else {
+			changed = append(changed, fmt.Sprintf("required_capability=%s", actual))
 		}
 	}
 	if len(changed) == 0 {

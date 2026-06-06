@@ -5,16 +5,17 @@ import "time"
 
 // Domain row.
 type Domain struct {
-	ID              int64      `gorm:"primaryKey;column:id"`
-	Host            string     `gorm:"column:host;uniqueIndex"`
-	Scheme          string     `gorm:"column:scheme"`
-	IsActive        bool       `gorm:"column:is_active"`
-	CrawlDelayMS    int        `gorm:"column:crawl_delay_ms"`
-	RobotsBody      *string    `gorm:"column:robots_body"`
-	RobotsFetchedAt *time.Time `gorm:"column:robots_fetched_at"`
-	LastRequestAt   *time.Time `gorm:"column:last_request_at"`
-	CreatedAt       time.Time  `gorm:"column:created_at"`
-	EmbedCollection *string    `gorm:"column:embed_collection"`
+	ID                 int64      `gorm:"primaryKey;column:id"`
+	Host               string     `gorm:"column:host;uniqueIndex"`
+	Scheme             string     `gorm:"column:scheme"`
+	IsActive           bool       `gorm:"column:is_active"`
+	CrawlDelayMS       int        `gorm:"column:crawl_delay_ms"`
+	RobotsBody         *string    `gorm:"column:robots_body"`
+	RobotsFetchedAt    *time.Time `gorm:"column:robots_fetched_at"`
+	LastRequestAt      *time.Time `gorm:"column:last_request_at"`
+	CreatedAt          time.Time  `gorm:"column:created_at"`
+	EmbedCollection    *string    `gorm:"column:embed_collection"`
+	RequiredCapability *string    `gorm:"column:required_capability"`
 }
 
 func (Domain) TableName() string { return "domains" }

@@ -108,8 +108,9 @@ func (h *JobsHandler) Reserve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, reserveResp{Jobs: []reserveJobDTO{}})
 		return
 	}
+	// Use the server-stored capabilities, not the (potentially spoofed) request body.
 	leased, err := h.Svc.ReserveJobs(r.Context(), frontier.ReserveRequest{
-		WorkerID: wk.ID, Batch: effBatch, Capabilities: req.Capabilities,
+		WorkerID: wk.ID, Batch: effBatch, Capabilities: wk.Capabilities,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "reserve_failed", err.Error())

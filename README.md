@@ -6,7 +6,7 @@ Distributed web crawler + data lake. Central Go registry hands jobs to anonymous
 - **Architecture:** Domain-Driven Design (ports + adapters) + CQRS (single writer, many readers)
 - **Stack:** Go 1.25+, gorm, go-chi/v5, urfave/cli/v3, pressly/goose/v3, glebarez/sqlite (no cgo), aws-sdk-go-v2 (S3)
 - **DBs:** SQLite (default), PostgreSQL, MySQL — same migrations and same code path
-- **Status:** Slices 1–11 shipped, smoke-tested end-to-end (crawl + pipeline + embed + S3 migration + multi-DB + external task workers + worker pool + capabilities + concurrency caps + data-lake read API + declarative pipeline triggers + scope-locked crawl + 12+ file types + realtime domain mgmt + per-domain vector collections + registry-owned Qdrant + search endpoint + reference embed worker + queue ops + ban-with-release)
+- **Status:** Slices 1–12 shipped, smoke-tested end-to-end (crawl + pipeline + embed + S3 migration + multi-DB + external task workers + worker pool + capabilities + concurrency caps + data-lake read API + declarative pipeline triggers + scope-locked crawl + 12+ file types + realtime domain mgmt + per-domain vector collections + registry-owned Qdrant + search endpoint + reference embed worker + queue ops + ban-with-release + domain↔worker binding)
 
 ---
 
@@ -264,10 +264,62 @@ registry update-domain --host example.com --scheme http
 registry update-domain --host example.com --embed-collection lithuania_news
 registry update-domain --host example.com --embed-collection -    # clear override (chunks fall back to host)
 
+# Bind a domain to a specific worker class (slice 12).
+# Only workers with this capability can reserve URLs of this domain.
+registry update-domain --host spa.example.com --required-capability js_render
+registry update-domain --host api.legacy.com --required-capability auth_required
+registry update-domain --host foo.com        --required-capability domain:foo.com   # fine-grained 1:1 binding
+registry update-domain --host foo.com        --required-capability -                # clear (any crawl worker)
+
 # Add a URL to the frontier
 registry enqueue --url https://example.com/
 registry enqueue --url https://example.com/deep --depth 2 --priority 10
 ```
+
+#### Binding a domain to specific workers (slice 12)
+
+Use cases:
+
+- A JS-rendered SPA needs a Playwright/Puppeteer worker (custom Python/Node bin).
+- A legacy site needs auth tokens that only one worker holds.
+- A specific domain is so critical it should only be handled by a dedicated GPU box.
+
+Mechanism: each `domains` row has an optional `required_capability TEXT` column. When set, the reserve query filters out URLs from that domain unless the worker's `capabilities` set includes the string. The naming convention is **operator's choice** — the server only does string-membership matching.
+
+Pattern A — semantic capability classes:
+
+```bash
+registry update-domain --host spa.example.com   --required-capability js_render
+registry update-domain --host api.legacy.com    --required-capability auth_required
+registry update-domain --host slow.example.org  --required-capability polite_only
+
+registry create-worker --label playwright-1 --capabilities crawl,js_render     --max-concurrent 4
+registry create-worker --label legacy-py-1  --capabilities crawl,auth_required --max-concurrent 2
+```
+
+Pattern B — explicit 1:1 binding (worker handles only this one domain):
+
+```bash
+registry update-domain --host foo.com --required-capability domain:foo.com
+registry update-domain --host bar.com --required-capability domain:bar.com
+
+registry create-worker --label foo-py-1 --capabilities crawl,domain:foo.com --max-concurrent 2
+registry create-worker --label bar-node-1 --capabilities crawl,domain:bar.com --max-concurrent 2
+```
+
+Pattern C — fallback "generic" workers handle everything unrestricted:
+
+```bash
+# No --required-capability on these domains → any crawl-capable worker reserves them.
+registry create-worker --label generic-crawl --capabilities crawl --max-concurrent 16
+```
+
+Notes:
+
+- `list-domains` shows the binding in the `REQ_CAP` column (`(any)` when unset).
+- Empty capabilities on a worker (legacy / no caps stored) is still treated as "any kind allowed" — including bound domains. To opt fully into the capability system, set explicit caps on every worker.
+- Clear a binding with `update-domain --host X --required-capability -`.
+- The server uses the **server-stored** worker capability set, not the request body — workers cannot spoof their way into a bound domain.
 
 #### Scoping the crawl (don't let it escape)
 
@@ -1593,6 +1645,7 @@ bash scripts/smoke_scope.sh     # scope-locked crawl (discovered links can't esc
 bash scripts/smoke_files.sh     # office_to_pdf + text_passthrough + per-domain collection
 bash scripts/smoke_qdrant.sh    # registry → Qdrant upsert (9 shards) + /v1/search
 bash scripts/smoke_queueops.sh  # embedworker + queue-stats + ban-worker --release + requeue
+bash scripts/smoke_bind.sh      # domain ↔ worker binding via required_capability
 ```
 
 `scripts/smoke.sh` does the slice 1–5 end-to-end:

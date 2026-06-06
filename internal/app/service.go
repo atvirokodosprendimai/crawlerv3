@@ -74,6 +74,11 @@ func (s *Service) SetPipeline(p *Pipeline) { s.Pipeline = p }
 func (s *Service) SetDispatcher(d *TriggerDispatcher) { s.Dispatcher = d }
 
 // ReserveJobs leases up to req.Batch jobs for the worker.
+//
+// req.Capabilities is the worker's server-stored capability set (NOT
+// client-supplied) — the caller is expected to pass wk.Capabilities from the
+// PAT-authenticated context. The slice gates per-domain required_capability
+// filtering in the underlying SQL.
 func (s *Service) ReserveJobs(ctx context.Context, req frontier.ReserveRequest) ([]frontier.LeasedJob, error) {
 	if req.Batch <= 0 {
 		req.Batch = s.Cfg.DefaultBatch
@@ -81,7 +86,7 @@ func (s *Service) ReserveJobs(ctx context.Context, req frontier.ReserveRequest) 
 	sign := func(urlHash []byte, expires time.Time) (string, []byte) {
 		return s.Lease.Sign(urlHash, req.WorkerID, expires)
 	}
-	return s.Frontier.Reserve(ctx, req.WorkerID, req.Batch, s.Cfg.LeaseTTL, sign)
+	return s.Frontier.Reserve(ctx, req.WorkerID, req.Capabilities, req.Batch, s.Cfg.LeaseTTL, sign)
 }
 
 // Heartbeat extends the lease for a single job.

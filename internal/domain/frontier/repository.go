@@ -11,9 +11,10 @@ type Repository interface {
 	Enqueue(ctx context.Context, j Job) (inserted bool, err error)
 
 	// Reserve leases up to batch jobs for the given worker. Respects per-domain
-	// crawl_delay_ms and skips dead/leased rows. Returns the leased jobs paired
-	// with their lease metadata.
-	Reserve(ctx context.Context, workerID int64, batch int, leaseTTL time.Duration, leaseToken func(urlHash []byte, expires time.Time) (string, []byte)) ([]LeasedJob, error)
+	// crawl_delay_ms and skips dead/leased rows. The capabilities slice gates
+	// per-domain required_capability filtering: empty = match any, otherwise
+	// only domains with a matching (or empty) required_capability are eligible.
+	Reserve(ctx context.Context, workerID int64, capabilities []string, batch int, leaseTTL time.Duration, leaseToken func(urlHash []byte, expires time.Time) (string, []byte)) ([]LeasedJob, error)
 
 	// Heartbeat extends the lease if the token matches.
 	Heartbeat(ctx context.Context, urlHash []byte, leaseToken []byte, extend time.Duration) (newExpiry time.Time, err error)

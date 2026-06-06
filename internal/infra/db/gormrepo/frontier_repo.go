@@ -88,6 +88,9 @@ func mapDomain(d *Domain) *frontier.DomainRow {
 	if d.EmbedCollection != nil {
 		row.EmbedCollection = *d.EmbedCollection
 	}
+	if d.RequiredCapability != nil {
+		row.RequiredCapability = *d.RequiredCapability
+	}
 	return row
 }
 
@@ -111,6 +114,27 @@ func (r *FrontierRepo) UpdateCrawlDelay(ctx context.Context, host string, ms int
 func (r *FrontierRepo) UpdateScheme(ctx context.Context, host, scheme string) error {
 	res := r.DB.W.WithContext(ctx).Model(&Domain{}).Where("host = ?", host).
 		Update("scheme", scheme)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errors.New("domain not found")
+	}
+	return nil
+}
+
+// UpdateRequiredCapability sets the per-domain worker-binding hint. Workers
+// must have this capability to reserve URLs of this domain. Empty string
+// clears the binding (any crawl-capable worker can then reserve).
+func (r *FrontierRepo) UpdateRequiredCapability(ctx context.Context, host, capability string) error {
+	var val interface{}
+	if capability == "" {
+		val = nil
+	} else {
+		val = capability
+	}
+	res := r.DB.W.WithContext(ctx).Model(&Domain{}).Where("host = ?", host).
+		Update("required_capability", val)
 	if res.Error != nil {
 		return res.Error
 	}
@@ -205,6 +229,7 @@ func (r *FrontierRepo) LookupCanonical(ctx context.Context, urlHash []byte) (boo
 func (r *FrontierRepo) Reserve(
 	ctx context.Context,
 	workerID int64,
+	capabilities []string,
 	batch int,
 	leaseTTL time.Duration,
 	signLease func(urlHash []byte, expires time.Time) (string, []byte),
@@ -219,6 +244,16 @@ func (r *FrontierRepo) Reserve(
 
 	politenessExpr := politenessSQL(r.DB.Driver)
 
+	// Build the optional capability filter. Empty capabilities = "any domain"
+	// (backward-compat with slice 1-11 workers without explicit caps).
+	capFilter := ""
+	args := []interface{}{now, now}
+	if len(capabilities) > 0 {
+		capFilter = ` AND (d.required_capability IS NULL OR d.required_capability = '' OR d.required_capability IN ?)`
+		args = append(args, capabilities)
+	}
+	args = append(args, batch)
+
 	err := r.DB.WriteTX(ctx, func(tx *rwdb.Tx) error {
 		pickSQL := fmt.Sprintf(`
 SELECT url_hash, domain_id FROM (
@@ -230,15 +265,15 @@ SELECT url_hash, domain_id FROM (
     AND cf.scheduled_for <= ?
     AND (cf.next_retry_at IS NULL OR cf.next_retry_at <= ?)
     AND d.is_active = 1
-    AND %s
-) ranked WHERE rn = 1 LIMIT ?`, politenessExpr)
+    AND %s%s
+) ranked WHERE rn = 1 LIMIT ?`, politenessExpr, capFilter)
 
 		type pickRow struct {
 			URLHash  []byte `gorm:"column:url_hash"`
 			DomainID int64  `gorm:"column:domain_id"`
 		}
 		var picks []pickRow
-		if err := tx.Raw(pickSQL, now, now, batch).Scan(&picks).Error; err != nil {
+		if err := tx.Raw(pickSQL, args...).Scan(&picks).Error; err != nil {
 			return fmt.Errorf("reserve: pick: %w", err)
 		}
 		if len(picks) == 0 {
