@@ -75,7 +75,7 @@ crawlerv3/
 │   ├── worker/        # reference Go crawl worker
 │   ├── taskworker/    # reference external processing worker (PDF OCR / Office→PDF / …)
 │   ├── ocrworker/     # dedicated PDF OCR worker (mutool + gs + tesseract page-parallel)
-│   ├── embedworker/   # reference external embedding worker (Ollama-style or shell-out)
+│   ├── embedworker/   # load-balanced embedding worker (Ollama /api/embed batch, fleet round-robin)
 │   ├── agent/         # unified worker: crawl + multiple task kinds + embed in one bin
 │   └── migrator/      # local↔s3 blob mover
 ├── internal/
@@ -758,62 +758,72 @@ registry create-worker --label multi-1 \
 
 ### `embedworker`
 
-Reference external embedding worker. Loops `reserve → embed → push vector`. Two backends, pick one (mutually exclusive):
+Load-balanced embedding worker for an Ollama fleet. Loop:
+
+1. Reserve `--batch` chunks from `/v1/embed/reserve` (default **1024**).
+2. Split into `--embed-batch` sub-batches (default **64**) and dispatch them round-robin across the fleet via an atomic counter. Each Ollama host gets at most one in-flight call by default (`--max-concurrent = len(fleet)`).
+3. POST `{model, input:[texts]}` to `{url}/api/embed` — the **batch** endpoint, not `/api/embeddings`. Keeps GPUs loaded.
+4. On batch failure or length mismatch, retry each text singly so one poisoned chunk doesn't lose the whole sub-batch's lease.
+5. POST all vectors to `/v1/embed/result`. Registry upserts into Qdrant. No local store.
 
 ```
 embedworker \
   --registry        http://localhost:8080
   --pat             <PAT>
-  --batch           64
+  --batch           1024          # chunks per /v1/embed/reserve
+  --embed-batch     64            # chunks per Ollama /api/embed call
+  --max-concurrent  0             # 0 = len(fleet)
   --idle-sleep      5s
-  --max-runtime     0           # 0 = run forever
+  --max-runtime     0             # 0 = run forever
 
-  # Backend A — HTTP (Ollama-style /api/embeddings; also LocalAI, llama.cpp server)
-  --embed-url       http://localhost:11434
+  # Fleet (at least one URL required — repeat the flag or use the file form)
+  --embed-url       http://gpu-01:11434
+  --embed-url       http://gpu-02:11434
+  # …or:
+  --embed-urls-file fleet.txt     # one URL per line; # comments OK
+
   --embed-model     nomic-embed-text
   --embed-api-key   <optional Bearer>
-
-  # Backend B — shell-out (stdin = chunk text; stdout must contain a JSON line {"embedding":[...]})
-  --extract-cmd     "python3 /opt/embed.py"
-  --exec-timeout    60s
+  --embed-timeout   120s
 ```
 
 | Flag (env) | Default | When to use |
 |---|---|---|
 | `--registry` (`REGISTRY`) | — *(required)* | Registry base URL. |
 | `--pat` (`PAT`) | — *(required)* | Worker must have the `embed` capability. |
-| `--batch` | `64` | Chunks per `/v1/embed/reserve`. Higher = fewer round-trips; lower = faster failure recovery if the model crashes. Tune to your GPU's effective batch limit. |
+| `--batch` | `1024` | Chunks per `/v1/embed/reserve`. Big reserves amortize the HTTP round-trip to the registry and give the fleet enough work to stay busy. |
+| `--embed-batch` | `64` | Chunks per Ollama `/api/embed` call. Tune to your GPU's effective batch limit (bge-m3 ~64–128, nomic-embed-text ~128–256). |
+| `--max-concurrent` | `0` → `len(fleet)` | In-flight Ollama calls. 0 picks fleet size so each host gets exactly one concurrent batch. Raise to over-subscribe; lower to drain a partial fleet gently. |
 | `--idle-sleep` | `5s` | Sleep between empty reserves. |
 | `--max-runtime` | `0` (forever) | Burst pattern: spot GPU draining queue in a cron window. |
-| `--embed-url` (`EMBED_URL`) | — | **Backend A.** Ollama / LocalAI / llama.cpp-server base URL. Worker POSTs to `{url}/api/embeddings`. Pick when you already run a model server. |
-| `--embed-model` | `nomic-embed-text` | Model name in the request body. Must match a model the server has loaded. |
-| `--embed-api-key` (`EMBED_API_KEY`) | — | Optional Bearer for hosted Ollama/OpenAI-compatible endpoints. |
-| `--extract-cmd` (`EXTRACT_CMD`) | — | **Backend B.** Shell command — stdin = chunk text, stdout = JSON `{"embedding":[...]}`. Pick when you want a custom Python wrapper or no HTTP layer. Mutually exclusive with `--embed-url`. |
-| `--exec-timeout` | `60s` | Backend-B kill. Raise for large models / cold-start latency. |
+| `--embed-url` (`EMBED_URL`) | — | Ollama base URL. **Repeatable** for a fleet (e.g. `--embed-url http://h1:11434 --embed-url http://h2:11434`). Worker POSTs to `{url}/api/embed`. |
+| `--embed-urls-file` (`EMBED_URLS_FILE`) | — | File with one Ollama base URL per line. Lines starting with `#` are comments. Merged + deduped with `--embed-url`. Use this for 16+ host fleets. |
+| `--embed-model` (`EMBED_MODEL`) | `nomic-embed-text` | Model name in the request body. Must match a model the fleet has loaded. Switch to `bge-m3` for 1024-dim multilingual; switching dims requires rotating the Qdrant collection on the registry. |
+| `--embed-api-key` (`EMBED_API_KEY`) | — | Optional Bearer for hosted Ollama / OpenAI-compatible endpoints. |
+| `--embed-timeout` | `120s` | Per-call HTTP timeout. Raise for cold-start or long sub-batches. |
 
-GPU box typical setup:
+GPU fleet typical setup (16 GPUs × 2 Ollama processes = 32 endpoints):
 
 ```bash
 # On registry: PAT for the embed worker
-registry create-worker --label gpu-embed-1 --capabilities embed --max-concurrent 8
+registry create-worker --label gpu-fleet-1 --capabilities embed --max-concurrent 32
 
-# On GPU box: run Ollama (or LocalAI / llama.cpp-server) and point embedworker at it
-ollama serve &
+# fleet.txt:
+#   http://gpu-01:11434
+#   http://gpu-01:11435
+#   http://gpu-02:11434
+#   http://gpu-02:11435
+#   ...
+
 embedworker --registry https://registry.example.com --pat $PAT \
-            --batch 64 --idle-sleep 3s \
-            --embed-url http://localhost:11434 --embed-model nomic-embed-text
+            --embed-urls-file fleet.txt \
+            --embed-model bge-m3 \
+            --batch 2048 --embed-batch 128
 ```
 
-Or via the unified `agent`:
+For a single-GPU dev box just pass one `--embed-url`. The unified `agent` binary still handles the `embed` role for that single-URL case (`--enable embed --embed-url ...`); for multi-host fleets use the standalone `embedworker`.
 
-```bash
-agent --registry $URL --pat $PAT \
-      --enable embed \
-      --embed-url http://localhost:11434 --embed-model nomic-embed-text \
-      --batch 64
-```
-
-Same protocol either way — server handles Qdrant upserts when `--qdrant-url` is configured on the registry; the embed worker just hands back vectors.
+Same protocol either way — registry handles Qdrant upserts when `--qdrant-url` is configured; the embed worker just hands back vectors.
 
 ### `migrator`
 
