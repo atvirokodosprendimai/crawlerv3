@@ -20,6 +20,7 @@ func Router(
 	embed *app.EmbedSvc,
 	tasks *app.TaskSvc,
 	search *app.SearchSvc,
+	fts *app.FTSSvc,
 	workers workerid.Repository,
 	lakeRepo lake.Repository,
 	blobs lake.BlobStore,
@@ -78,6 +79,11 @@ func Router(
 		if search != nil {
 			sh := NewSearchHandler(search)
 			r.Post("/search", sh.Search)
+		}
+
+		if fts != nil && fts.Enabled() {
+			fh := NewFTSHandler(fts)
+			r.Post("/search/fts", fh.Search)
 		}
 	})
 	return r

@@ -20,6 +20,7 @@ Distributed web crawler + data lake. Central Go registry hands jobs to anonymous
    - [`registry`](#registry) — server, migrations, worker pool, frontier, backfill, triggers
    - [`worker`](#worker) — reference crawl worker
    - [`taskworker`](#taskworker) — single-kind external processing worker
+   - [`ocrworker`](#ocrworker) — dedicated PDF OCR worker (mutool + gs + tesseract page-parallel)
    - [`agent`](#agent) — unified worker (crawl + multiple task kinds)
    - [`migrator`](#migrator) — local↔S3 blob mover
 6. [Configuration (env vars)](#configuration-env-vars)
@@ -30,6 +31,8 @@ Distributed web crawler + data lake. Central Go registry hands jobs to anonymous
    - [Crawl: `/v1/jobs/*`](#crawl-v1jobs)
    - [Embed: `/v1/embed/*`](#embed-v1embed)
    - [Read API: `/v1/lake`, `/v1/extracted`, `/v1/chunks`](#read-api-for-sink-workers-v1lake-v1extracted-v1chunks)
+   - [Search: `/v1/search` (Qdrant vector)](#search-v1search)
+   - [FTS Search: `/v1/search/fts` (Stanza + Quickwit)](#fts-search-v1searchfts-stanza--quickwit)
    - [Pipeline triggers (`registry trigger-*`)](#pipeline-triggers-registry-trigger-)
    - [Tasks: `/v1/tasks/*`](#tasks-v1tasks)
    - [Blobs: `/v1/blobs/{id}`](#blobs-v1blobsid)
@@ -71,6 +74,7 @@ crawlerv3/
 │   ├── registry/      # control-plane: serve + migrate + workers + domains + frontier + triggers + queue ops
 │   ├── worker/        # reference Go crawl worker
 │   ├── taskworker/    # reference external processing worker (PDF OCR / Office→PDF / …)
+│   ├── ocrworker/     # dedicated PDF OCR worker (mutool + gs + tesseract page-parallel)
 │   ├── embedworker/   # reference external embedding worker (Ollama-style or shell-out)
 │   ├── agent/         # unified worker: crawl + multiple task kinds + embed in one bin
 │   └── migrator/      # local↔s3 blob mover
@@ -623,6 +627,68 @@ Placeholders in `--extract-cmd`:
 
 In `text` mode, the command's stdout becomes `extracted_text`. In `blob` mode, the first file matching `--output-glob` is uploaded as a new lake object, the source task's `output_lake_object_id` is set, and a fresh `processing_jobs` row is enqueued for `--next-processor` if non-empty.
 
+### `ocrworker`
+
+Dedicated `pdf_ocr` task worker. Replaces the naive `taskworker --extract-cmd "tesseract {input}"` shape (which only handles single-page images) with a real multi-page pipeline:
+
+```
+mutool show {pdf} trailer/Root/Pages/Count  → page count
+gs -sDEVICE=pnggray -r{dpi} ...             → one PNG per page (parallel)
+tesseract -l {lang} ...                     → one .txt per page (parallel)
+```
+
+Concatenated page text (joined with `\n\n`) is posted to `/v1/tasks/result` as `extracted_text`. Same PAT-auth, reserve/heartbeat/fail protocol as `taskworker`.
+
+```
+ocrworker \
+  --registry            http://localhost:8080
+  --pat                 <PAT>
+  --batch               4                     # tasks per /v1/tasks/reserve call
+  --concurrency         2                     # PDFs in parallel from one batch
+  --page-concurrency    4                     # pages OCR'd in parallel within one PDF
+  --tesseract-lang      eng+lit
+  --render-dpi          300
+  --idle-sleep          5s
+  --max-runtime         0                     # 0 = run forever
+  --exec-timeout        10m                   # wall-clock per PDF end-to-end
+  --page-timeout        2m                    # per-page (gs + tesseract)
+  --heartbeat-interval  30s
+```
+
+| Flag (env) | Default | When to use |
+|---|---|---|
+| `--registry` (`REGISTRY`) | — *(required)* | Registry base URL. |
+| `--pat` (`PAT`) | — *(required)* | Issued via `create-worker --capabilities pdf_ocr`. |
+| `--batch` | `4` | Tasks per reserve. |
+| `--concurrency` | `2` | Outer parallelism: PDFs from one reserved batch worked simultaneously. |
+| `--page-concurrency` (`PAGE_CONCURRENCY`) | `4` | Inner parallelism: pages of one PDF rasterized + OCR'd in parallel. Tune to box CPU. |
+| `--tesseract-lang` (`TESSERACT_LANG`) | `eng+lit` | Tesseract language packs (`-l`). Must be installed on the host. |
+| `--render-dpi` | `300` | Ghostscript rasterization DPI. Lower for speed, higher for fine print. |
+| `--idle-sleep` | `5s` | Sleep when reserve returns empty. |
+| `--max-runtime` | `0` (forever) | Exit cleanly after N. Useful for k8s CronJob / spot bursts. |
+| `--exec-timeout` | `10m` | Wall-clock budget for one PDF end-to-end (mutool + all pages). |
+| `--page-timeout` | `2m` | Per-page `gs + tesseract` kill. Set above your slowest realistic page. |
+| `--heartbeat-interval` | `30s` | POST `/v1/tasks/heartbeat` cadence; 0 disables. |
+| `--log-level` (`LOG_LEVEL`) | `info` | `debug | info | warn | error`. |
+
+**Required tools on PATH** (checked at startup, fail-fast): `mutool` (mupdf-tools), `gs` (ghostscript), `tesseract` (+ language packs).
+
+Example — GPU box, 16 cores, Lithuanian + English documents:
+
+```bash
+ocrworker --registry https://registry.example.com --pat $PAT \
+          --batch 4 --concurrency 4 --page-concurrency 8 \
+          --tesseract-lang lit+eng --render-dpi 300
+```
+
+When to pick `ocrworker` vs `taskworker --kind pdf_ocr`:
+
+| Need | Pick |
+|---|---|
+| Multi-page PDF, real-world scans | `ocrworker` (`gs` page rasterization + page-parallel tesseract) |
+| Single-page image already in lake (PNG/JPG) | `taskworker --extract-cmd "tesseract {input} -"` |
+| One binary, mixed workload (crawl + DOCX + PDF) | `agent` |
+
 ### `agent`
 
 Unified worker — one process, many capabilities. Replaces running `worker` + multiple `taskworker` instances on one box. Per-kind flags via `--<flag>.<kind>` shape.
@@ -1170,6 +1236,65 @@ Response:
 
 Requires `--qdrant-url` set on the registry; without it the endpoint returns `500 search: qdrant not configured`. `query_text` further requires `--embed-url`.
 
+### FTS Search: `/v1/search/fts` (Stanza + Quickwit)
+
+Full-text retrieval against a Quickwit index, with **symmetric Stanza rewrite** applied to both ingest text and search queries. Same Python service mutates writes and reads so the index and the query live in the same lexical space.
+
+```
+                   extract                Stanza               Quickwit
+  ┌──────────┐    ──────────►  ┌────────┐ rewrite  ┌────────┐  ingest
+  │ Pipeline │                 │ FTSSvc │────────► │ Stanza │ ──────►  Quickwit index
+  │ TaskSvc  │                 └────────┘          │  API   │           ▲
+  └──────────┘                                     └────────┘           │
+                                                                        │
+  /v1/search/fts ──► FTSSvc.SearchByText ──► Stanza rewrite ──► Quickwit search
+```
+
+Wire it on via four flags (any missing → that side disabled):
+
+```
+registry serve \
+  --stanza-url       http://stanza.local:8000 \   # POST {url}/rewrite {text}→{text}
+  --stanza-path      /rewrite                 \   # optional override; default /rewrite
+  --stanza-api-key   "$STANZA_KEY"            \   # optional bearer
+  --quickwit-url     http://quickwit.local:7280 \ # empty disables FTS entirely
+  --quickwit-api-key "$QW_KEY"                \
+  --quickwit-index   extracted                    # default index for ingest + search
+```
+
+When `--quickwit-url` is set, the pipeline automatically forwards every new `extracted_documents` row (HTML strip, text passthrough, PDF OCR, all task-worker text results) through Stanza → Quickwit. FTS ingest is **best-effort**: failures are logged but never block the main pipeline (chunks → embed → Qdrant keeps running). When `--stanza-url` is empty, raw text is indexed unchanged.
+
+#### `POST /v1/search/fts`
+
+```json
+{
+  "query": "signalų teorija",
+  "index": "extracted",
+  "limit": 10
+}
+```
+
+`index` is optional; falls back to `--quickwit-index`. Server applies Stanza rewrite to the query (if `--stanza-url` set), then forwards to Quickwit `/api/v1/{index}/search`. Response:
+
+```json
+{
+  "count": 1,
+  "items": [
+    {
+      "score": 4.21,
+      "doc": {
+        "document_id":    42,
+        "lake_object_id": 17,
+        "collection":     "lithuania_news",
+        "text":           "<Stanza-rewritten text>"
+      }
+    }
+  ]
+}
+```
+
+Capability required: `search` (same as `/v1/search`). Endpoint is only registered when `--quickwit-url` is set.
+
 ### Per-domain vector collections (Qdrant / others)
 
 Each `domains` row has an optional `embed_collection TEXT` column. At extraction time the server walks `lake_object → frontier → domain` and stamps the resolved collection onto `extracted_documents.collection`. Chunks inherit it via `document_id`, and `/v1/embed/reserve` surfaces it per chunk.
@@ -1652,7 +1777,12 @@ registry create-worker --label gpu-ocr-1 --capabilities pdf_ocr --max-concurrent
 # (Optional) Backfill: enqueue pdf_ocr tasks for every PDF already in the lake
 registry reprocess --processor pdf_ocr
 
-# On the GPU box: deploy taskworker (or agent)
+# On the GPU box: deploy ocrworker (dedicated, multi-page PDF support)
+ocrworker --registry https://registry.example.com --pat $PAT \
+          --batch 4 --concurrency 4 --page-concurrency 8 \
+          --tesseract-lang lit+eng
+
+# Or, for single-page image OCR, fall back to the generic taskworker:
 taskworker --registry https://registry.example.com --pat $PAT \
            --kind pdf_ocr --batch 4 --idle-sleep 10s \
            --mode text --extract-cmd "tesseract {input} - -l eng+lit"

@@ -33,6 +33,7 @@ type Pipeline struct {
 	ChunkCfg           chunker.Config
 	InternalProcessors []processing.Processor
 	Resolver           *CollectionResolver // optional; resolves per-domain embed collection
+	FTS                *FTSSvc             // optional; mirrors extracted text into Quickwit (Stanza-rewritten)
 }
 
 // NewPipeline wires a Pipeline. By default html_strip and text_passthrough
@@ -51,6 +52,11 @@ func NewPipeline(l lake.Repository, b lake.BlobStore, p processing.Repository, e
 
 // SetResolver wires the collection resolver for per-domain embed routing.
 func (p *Pipeline) SetResolver(r *CollectionResolver) { p.Resolver = r }
+
+// SetFTS attaches an FTSSvc; when set, the pipeline forwards extracted text
+// (Stanza-rewritten) into Quickwit after every extraction upsert. Failures
+// are logged inside FTSSvc and never block the pipeline.
+func (p *Pipeline) SetFTS(f *FTSSvc) { p.FTS = f }
 
 // Run polls for queued processing_jobs and dispatches them.
 // Stops when ctx is cancelled.
@@ -121,13 +127,17 @@ func (p *Pipeline) execHTML(ctx context.Context, job *processing.Job) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
+	collection := p.resolveCollection(ctx, job.LakeObjectID)
 	docID, err := p.Extractions.Upsert(ctx, extraction.Document{
 		SourceLakeObjectID: job.LakeObjectID,
 		Text:               text,
-		Collection:         p.resolveCollection(ctx, job.LakeObjectID),
+		Collection:         collection,
 	})
 	if err != nil {
 		return fmt.Errorf("extracted upsert: %w", err)
+	}
+	if p.FTS != nil {
+		p.FTS.OnExtracted(ctx, docID, job.LakeObjectID, collection, text)
 	}
 	return p.writeChunks(ctx, docID, text)
 }
@@ -153,13 +163,17 @@ func (p *Pipeline) execTextPassthrough(ctx context.Context, job *processing.Job)
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
+	collection := p.resolveCollection(ctx, job.LakeObjectID)
 	docID, err := p.Extractions.Upsert(ctx, extraction.Document{
 		SourceLakeObjectID: job.LakeObjectID,
 		Text:               text,
-		Collection:         p.resolveCollection(ctx, job.LakeObjectID),
+		Collection:         collection,
 	})
 	if err != nil {
 		return fmt.Errorf("extracted upsert: %w", err)
+	}
+	if p.FTS != nil {
+		p.FTS.OnExtracted(ctx, docID, job.LakeObjectID, collection, text)
 	}
 	return p.writeChunks(ctx, docID, text)
 }
@@ -187,14 +201,18 @@ func (p *Pipeline) execPDF(ctx context.Context, job *processing.Job) error {
 	if err != nil {
 		return err // ErrSkip turns into MarkSkipped in caller
 	}
+	collection := p.resolveCollection(ctx, job.LakeObjectID)
 	docID, err := p.Extractions.Upsert(ctx, extraction.Document{
 		SourceLakeObjectID: job.LakeObjectID,
 		Text:               text,
 		PageCount:          pages,
-		Collection:         p.resolveCollection(ctx, job.LakeObjectID),
+		Collection:         collection,
 	})
 	if err != nil {
 		return err
+	}
+	if p.FTS != nil {
+		p.FTS.OnExtracted(ctx, docID, job.LakeObjectID, collection, text)
 	}
 	return p.writeChunks(ctx, docID, text)
 }

@@ -29,6 +29,7 @@ type TaskSvc struct {
 	ChunkCfg    chunker.Config
 	Dispatcher  *TriggerDispatcher  // optional; fires EvtBlobProduced on AcceptBlob
 	Resolver    *CollectionResolver // optional; per-domain embed_collection lookup
+	FTS         *FTSSvc             // optional; mirrors extracted text into Quickwit
 }
 
 // chunkInserter is the slice of chunking.Repository TaskSvc needs.
@@ -63,6 +64,10 @@ func (t *TaskSvc) SetDispatcher(d *TriggerDispatcher) { t.Dispatcher = d }
 
 // SetResolver wires the per-domain collection resolver.
 func (t *TaskSvc) SetResolver(r *CollectionResolver) { t.Resolver = r }
+
+// SetFTS attaches an FTSSvc; AcceptText will mirror the extracted text into
+// Quickwit (after Stanza rewrite if configured). Best-effort, never blocks.
+func (t *TaskSvc) SetFTS(f *FTSSvc) { t.FTS = f }
 
 // Reserve leases up to batch tasks of the given kinds.
 func (t *TaskSvc) Reserve(ctx context.Context, workerID int64, kinds []processing.Processor, batch int) ([]processing.LeasedTask, error) {
@@ -124,6 +129,9 @@ func (t *TaskSvc) AcceptText(ctx context.Context, in TextResult) error {
 	})
 	if err != nil {
 		return fmt.Errorf("extracted upsert: %w", err)
+	}
+	if t.FTS != nil {
+		t.FTS.OnExtracted(ctx, docID, job.LakeObjectID, collection, in.Text)
 	}
 	if t.Chunks != nil && in.Text != "" {
 		pieces := chunker.Split(in.Text, t.ChunkCfg)

@@ -38,6 +38,8 @@ import (
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/lease"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/logx"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/qdrant"
+	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/quickwit"
+	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/stanza"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/store/local"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/urls"
 )
@@ -79,6 +81,22 @@ func main() {
 				Usage: "Ollama-style /api/embeddings server URL for query_text path"},
 			&cli.StringFlag{Name: "embed-model", Value: "nomic-embed-text", Sources: cli.EnvVars("EMBED_MODEL")},
 			&cli.StringFlag{Name: "embed-api-key", Sources: cli.EnvVars("EMBED_API_KEY")},
+
+			// Stanza rewrite service — applied symmetrically to ingest text and
+			// search queries before they hit Quickwit. Optional.
+			&cli.StringFlag{Name: "stanza-url", Sources: cli.EnvVars("STANZA_URL"),
+				Usage: "Stanza rewrite service base URL (POST {url}/rewrite {text}->{text}). Empty disables."},
+			&cli.StringFlag{Name: "stanza-path", Value: "/rewrite", Sources: cli.EnvVars("STANZA_PATH"),
+				Usage: "request path on the Stanza service"},
+			&cli.StringFlag{Name: "stanza-api-key", Sources: cli.EnvVars("STANZA_API_KEY")},
+
+			// Quickwit FTS sink — receives Stanza-rewritten extracted text and
+			// serves /v1/search/fts queries. Optional.
+			&cli.StringFlag{Name: "quickwit-url", Sources: cli.EnvVars("QUICKWIT_URL"),
+				Usage: "Quickwit base URL (e.g. http://localhost:7280). Empty disables FTS push/search."},
+			&cli.StringFlag{Name: "quickwit-api-key", Sources: cli.EnvVars("QUICKWIT_API_KEY")},
+			&cli.StringFlag{Name: "quickwit-index", Value: "extracted", Sources: cli.EnvVars("QUICKWIT_INDEX"),
+				Usage: "default Quickwit index for ingest + search"},
 		},
 		Commands: []*cli.Command{
 			{Name: "serve", Usage: "run HTTP API", Flags: []cli.Flag{
@@ -232,6 +250,7 @@ type registryBundle struct {
 	Embed       *app.EmbedSvc
 	Tasks       *app.TaskSvc
 	Search      *app.SearchSvc
+	FTS         *app.FTSSvc
 	Pipeline    *app.Pipeline
 	Dispatcher  *app.TriggerDispatcher
 	Workers     workerid.Repository
@@ -305,8 +324,24 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 		searchSvc = app.NewSearchSvc(qcli, ecli)
 	}
 
+	// Stanza + Quickwit FTS (Stanza-rewritten text → Quickwit, symmetric on read).
+	stz := stanza.New(stanza.Config{
+		BaseURL: cmd.String("stanza-url"),
+		Path:    cmd.String("stanza-path"),
+		APIKey:  cmd.String("stanza-api-key"),
+	})
+	qwt := quickwit.New(quickwit.Config{
+		BaseURL: cmd.String("quickwit-url"),
+		APIKey:  cmd.String("quickwit-api-key"),
+	})
+	fts := app.NewFTSSvc(stz, qwt, cmd.String("quickwit-index"))
+	if fts.Enabled() {
+		pipe.SetFTS(fts)
+		tasks.SetFTS(fts)
+	}
+
 	return &registryBundle{
-		Svc: svc, Embed: embed, Tasks: tasks, Search: searchSvc,
+		Svc: svc, Embed: embed, Tasks: tasks, Search: searchSvc, FTS: fts,
 		Pipeline: pipe, Dispatcher: disp,
 		Workers: wrepo, Lake: lrepo, Blobs: blobs,
 		Extractions: erepo, Chunks: crepo,
@@ -325,7 +360,7 @@ func actionServe(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	handler := httpapi.Router(b.Svc, b.Embed, b.Tasks, b.Search, b.Workers, b.Lake, b.Blobs, b.Extractions, b.Chunks, cmd.Int64("max-body-bytes"))
+	handler := httpapi.Router(b.Svc, b.Embed, b.Tasks, b.Search, b.FTS, b.Workers, b.Lake, b.Blobs, b.Extractions, b.Chunks, cmd.Int64("max-body-bytes"))
 	srv := &http.Server{
 		Addr:              cmd.String("addr"),
 		Handler:           handler,
