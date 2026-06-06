@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -39,6 +40,8 @@ import (
 	"golang.org/x/net/html"
 
 	cli "github.com/urfave/cli/v3"
+
+	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/logx"
 )
 
 func main() {
@@ -67,11 +70,17 @@ func main() {
 				Usage: "Ollama-style /api/embeddings server URL for --enable embed"},
 			&cli.StringFlag{Name: "embed-model", Value: "nomic-embed-text"},
 			&cli.StringFlag{Name: "embed-api-key", Sources: cli.EnvVars("EMBED_API_KEY")},
+			&cli.StringFlag{Name: "log-level", Value: "info", Sources: cli.EnvVars("LOG_LEVEL"),
+				Usage: "debug | info | warn | error"},
+		},
+		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
+			logx.Init("agent", c.String("log-level"))
+			return ctx, nil
 		},
 		Action: run,
 	}
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
-		fmt.Fprintln(os.Stderr, "agent:", err)
+		slog.Error("agent exit", "err", err)
 		os.Exit(1)
 	}
 }
@@ -84,7 +93,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	defer cancel()
 	go func() {
 		<-stop
-		fmt.Println("agent: stopping")
+		slog.Info("stopping")
 		cancel()
 	}()
 
@@ -121,7 +130,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 				return
 			case "embed":
 				if embedURL == "" {
-					fmt.Fprintln(os.Stderr, "agent: --enable embed needs --embed-url")
+					slog.Error("--enable embed needs --embed-url")
 					return
 				}
 				embedLoop(ctx, c, registry, pat, batch, idle, embedURL, embedModel, embedAPIKey, execTO)
@@ -137,7 +146,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 				ExecTimeout: execTO,
 			}
 			if cfg.ExtractCmd == "" {
-				fmt.Fprintf(os.Stderr, "agent: kind=%s missing --extract-cmd.%s\n", kind, kind)
+				slog.Error("kind missing --extract-cmd", "kind", kind)
 				return
 			}
 			taskLoop(ctx, c, registry, pat, batch, idle, cfg)
@@ -165,15 +174,16 @@ func embedLoop(ctx context.Context, c *http.Client, registry, pat string, batch 
 		}
 		chunks, err := embedReserve(ctx, c, registry, pat, batch)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "embed reserve:", err)
+			slog.Error("embed reserve", "err", err)
 			sleep(ctx, idle)
 			continue
 		}
 		if len(chunks) == 0 {
+			slog.Debug("embed reserve empty, idling")
 			sleep(ctx, idle)
 			continue
 		}
-		fmt.Printf("agent embed: leased %d chunks\n", len(chunks))
+		slog.Info("embed batch reserved", "n", len(chunks))
 		results := make([]map[string]any, 0, len(chunks))
 		for _, ch := range chunks {
 			vec, err := embedHTTP(ctx, httpc, embedURL, model, apiKey, ch.Text)
@@ -190,7 +200,9 @@ func embedLoop(ctx context.Context, c *http.Client, registry, pat string, batch 
 			})
 		}
 		if err := embedPostResults(ctx, c, registry, pat, results); err != nil {
-			fmt.Fprintln(os.Stderr, "embed post:", err)
+			slog.Error("embed post", "err", err)
+		} else {
+			slog.Info("embed batch done", "n", len(results))
 		}
 	}
 }
@@ -287,14 +299,16 @@ func crawlLoop(ctx context.Context, c, fetchC *http.Client, registry, pat string
 		}
 		jobs, err := crawlReserve(ctx, c, registry, pat, batch)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "crawl reserve:", err)
+			slog.Error("crawl reserve", "err", err)
 			sleep(ctx, idle)
 			continue
 		}
 		if len(jobs) == 0 {
+			slog.Debug("crawl reserve empty, idling")
 			sleep(ctx, idle)
 			continue
 		}
+		slog.Info("crawl batch reserved", "n", len(jobs))
 		for _, j := range jobs {
 			crawlOne(ctx, fetchC, c, registry, pat, ua, j)
 		}
@@ -325,7 +339,7 @@ func crawlReserve(ctx context.Context, c *http.Client, registry, pat string, bat
 }
 
 func crawlOne(ctx context.Context, fetchC, c *http.Client, registry, pat, ua string, j crawlJob) {
-	fmt.Printf("agent crawl: %s\n", j.URL)
+	slog.Info("crawl fetch", "job_id", j.JobID, "url", j.URL, "depth", j.Depth)
 	req, err := http.NewRequestWithContext(ctx, "GET", j.URL, nil)
 	if err != nil {
 		crawlFail(ctx, c, registry, pat, j, "bad_url", err.Error(), false)
@@ -368,8 +382,10 @@ func crawlOne(ctx context.Context, fetchC, c *http.Client, registry, pat, ua str
 		"discovered_links": links,
 	}
 	if err := crawlPostResult(ctx, c, registry, pat, meta, buf.Bytes()); err != nil {
-		fmt.Fprintln(os.Stderr, "crawl post:", err)
+		slog.Error("crawl post", "job_id", j.JobID, "err", err)
+		return
 	}
+	slog.Info("crawl ok", "job_id", j.JobID, "status", resp.StatusCode, "bytes", n, "links", len(links))
 }
 
 func crawlPostResult(ctx context.Context, c *http.Client, registry, pat string, meta map[string]any, blob []byte) error {
@@ -509,14 +525,16 @@ func taskLoop(ctx context.Context, c *http.Client, registry, pat string, batch i
 		}
 		ts, err := taskReserve(ctx, c, registry, pat, []string{cfg.Kind}, batch)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "task reserve:", err)
+			slog.Error("task reserve", "kind", cfg.Kind, "err", err)
 			sleep(ctx, idle)
 			continue
 		}
 		if len(ts) == 0 {
+			slog.Debug("task reserve empty, idling", "kind", cfg.Kind)
 			sleep(ctx, idle)
 			continue
 		}
+		slog.Info("task batch reserved", "kind", cfg.Kind, "n", len(ts))
 		for _, t := range ts {
 			taskOne(ctx, c, registry, pat, t, cfg)
 		}
@@ -547,7 +565,7 @@ func taskReserve(ctx context.Context, c *http.Client, registry, pat string, kind
 }
 
 func taskOne(ctx context.Context, c *http.Client, registry, pat string, t taskItem, cfg taskKindCfg) {
-	fmt.Printf("agent task: kind=%s task=%d blob=%s\n", cfg.Kind, t.TaskID, t.BlobURL)
+	slog.Info("task start", "kind", cfg.Kind, "task_id", t.TaskID, "blob", t.BlobURL, "size", t.BlobSizeBytes)
 	scratch, err := os.MkdirTemp("", "agent-task-*")
 	if err != nil {
 		taskFail(ctx, c, registry, pat, t, "scratch_mkdir", err.Error(), true)
@@ -587,11 +605,15 @@ func taskOne(ctx context.Context, c *http.Client, registry, pat string, t taskIt
 			return
 		}
 		if err := taskPostBlob(ctx, c, registry, pat, t, matches[0], cfg.OutputCT, cfg.NextProc); err != nil {
-			fmt.Fprintln(os.Stderr, "task post blob:", err)
+			slog.Error("task post blob", "task_id", t.TaskID, "err", err)
+		} else {
+			slog.Info("task ok", "kind", cfg.Kind, "task_id", t.TaskID, "mode", "blob", "output", matches[0])
 		}
 	default: // text
 		if err := taskPostText(ctx, c, registry, pat, t, stdout.String()); err != nil {
-			fmt.Fprintln(os.Stderr, "task post text:", err)
+			slog.Error("task post text", "task_id", t.TaskID, "err", err)
+		} else {
+			slog.Info("task ok", "kind", cfg.Kind, "task_id", t.TaskID, "mode", "text", "text_bytes", stdout.Len())
 		}
 	}
 }

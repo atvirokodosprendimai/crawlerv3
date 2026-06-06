@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -26,6 +27,8 @@ import (
 	"golang.org/x/net/html"
 
 	cli "github.com/urfave/cli/v3"
+
+	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/logx"
 )
 
 func main() {
@@ -41,11 +44,17 @@ func main() {
 			&cli.DurationFlag{Name: "idle-sleep", Value: 3 * time.Second},
 			&cli.DurationFlag{Name: "fetch-timeout", Value: 30 * time.Second},
 			&cli.StringFlag{Name: "user-agent", Value: "crawlerv3-worker/0.1"},
+			&cli.StringFlag{Name: "log-level", Value: "info", Sources: cli.EnvVars("LOG_LEVEL"),
+				Usage: "debug | info | warn | error"},
+		},
+		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
+			logx.Init("worker", c.String("log-level"))
+			return ctx, nil
 		},
 		Action: runLoop,
 	}
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
-		fmt.Fprintln(os.Stderr, "worker:", err)
+		slog.Error("worker exit", "err", err)
 		os.Exit(1)
 	}
 }
@@ -86,7 +95,7 @@ func runLoop(ctx context.Context, cmd *cli.Command) error {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-stop
-		fmt.Println("worker: stopping")
+		slog.Info("stopping")
 		os.Exit(0)
 	}()
 
@@ -106,17 +115,21 @@ func runLoop(ctx context.Context, cmd *cli.Command) error {
 
 	sem := make(chan struct{}, conc)
 
+	slog.Info("worker started", "registry", registry, "batch", batch, "concurrency", conc, "fetch_timeout", fetchTO.String())
+
 	for {
 		jobs, err := reserve(ctx, apic, registry, pat, batch)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "reserve:", err)
+			slog.Error("reserve", "err", err)
 			time.Sleep(idle)
 			continue
 		}
 		if len(jobs) == 0 {
+			slog.Debug("reserve empty, idling", "sleep", idle.String())
 			time.Sleep(idle)
 			continue
 		}
+		slog.Info("batch reserved", "n", len(jobs))
 		var wg sync.WaitGroup
 		for _, j := range jobs {
 			wg.Add(1)
@@ -153,7 +166,11 @@ func reserve(ctx context.Context, c *http.Client, registry, pat string, batch in
 }
 
 func handleJob(ctx context.Context, httpc, apic *http.Client, registry, pat, ua string, j job) {
-	fmt.Printf("worker: fetch %s\n", j.URL)
+	start := time.Now()
+	slog.Info("fetch start", "job_id", j.JobID, "url", j.URL, "depth", j.Depth, "attempt", j.AttemptCount)
+	defer func() {
+		slog.Debug("fetch done", "job_id", j.JobID, "dur_ms", time.Since(start).Milliseconds())
+	}()
 	req, err := http.NewRequestWithContext(ctx, "GET", j.URL, nil)
 	if err != nil {
 		_ = postFail(ctx, apic, registry, pat, j.LeaseToken, 0, "bad_url", err.Error(), false)
@@ -199,8 +216,10 @@ func handleJob(ctx context.Context, httpc, apic *http.Client, registry, pat, ua 
 		DiscoveredLinks: links,
 	}
 	if err := postResult(ctx, apic, registry, pat, meta, buf.Bytes()); err != nil {
-		fmt.Fprintln(os.Stderr, "post result:", err)
+		slog.Error("post result", "job_id", j.JobID, "err", err)
+		return
 	}
+	slog.Info("fetch ok", "job_id", j.JobID, "status", resp.StatusCode, "bytes", n, "ct", ct, "links", len(links))
 }
 
 func postResult(ctx context.Context, c *http.Client, registry, pat string, meta resultMeta, blob []byte) error {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -110,9 +111,12 @@ func (h *TasksHandler) Reserve(w http.ResponseWriter, r *http.Request) {
 	}
 	leased, err := h.Svc.Reserve(r.Context(), wk.ID, kinds, effBatch)
 	if err != nil {
+		slog.ErrorContext(r.Context(), "tasks reserve", "worker_id", wk.ID, "err", err)
 		writeError(w, http.StatusInternalServerError, "reserve_failed", err.Error())
 		return
 	}
+	slog.InfoContext(r.Context(), "tasks reserved",
+		"worker_id", wk.ID, "kinds", req.Kinds, "requested", req.Batch, "granted", len(leased))
 	out := taskReserveResp{Tasks: make([]taskDTO, 0, len(leased))}
 	for _, lt := range leased {
 		out.Tasks = append(out.Tasks, taskDTO{
@@ -197,9 +201,13 @@ func (h *TasksHandler) Result(w http.ResponseWriter, r *http.Request) {
 			NextProcessor:     processing.Processor(meta.NextProcessor),
 		})
 		if err != nil {
+			slog.WarnContext(r.Context(), "tasks blob result rejected", "task_id", meta.TaskID, "err", err)
 			writeError(w, http.StatusConflict, "result_failed", err.Error())
 			return
 		}
+		slog.InfoContext(r.Context(), "tasks blob result accepted",
+			"task_id", meta.TaskID, "output_lake_object_id", id,
+			"next_processor", meta.NextProcessor)
 		writeJSON(w, http.StatusOK, map[string]any{"output_lake_object_id": id, "accepted": true})
 		return
 	}
@@ -211,9 +219,13 @@ func (h *TasksHandler) Result(w http.ResponseWriter, r *http.Request) {
 		Language:   meta.Language,
 		PageCount:  meta.PageCount,
 	}); err != nil {
+		slog.WarnContext(r.Context(), "tasks text result rejected", "task_id", meta.TaskID, "err", err)
 		writeError(w, http.StatusConflict, "result_failed", err.Error())
 		return
 	}
+	slog.InfoContext(r.Context(), "tasks text result accepted",
+		"task_id", meta.TaskID, "text_bytes", len(meta.ExtractedText),
+		"language", meta.Language, "page_count", meta.PageCount)
 	writeJSON(w, http.StatusOK, map[string]any{"accepted": true})
 }
 
@@ -229,9 +241,12 @@ func (h *TasksHandler) Fail(w http.ResponseWriter, r *http.Request) {
 		msg = req.ErrorCode + ": " + msg
 	}
 	if err := h.Svc.AcceptFailure(r.Context(), req.TaskID, req.LeaseToken, msg, req.Retryable); err != nil {
+		slog.WarnContext(r.Context(), "tasks fail rejected", "task_id", req.TaskID, "err", err)
 		writeError(w, http.StatusConflict, "fail_failed", err.Error())
 		return
 	}
+	slog.InfoContext(r.Context(), "tasks failure recorded",
+		"task_id", req.TaskID, "code", req.ErrorCode, "retryable", req.Retryable)
 	writeJSON(w, http.StatusOK, map[string]any{"recorded": true})
 }
 

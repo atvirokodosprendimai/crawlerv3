@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -113,9 +114,11 @@ func (h *JobsHandler) Reserve(w http.ResponseWriter, r *http.Request) {
 		WorkerID: wk.ID, Batch: effBatch, Capabilities: wk.Capabilities,
 	})
 	if err != nil {
+		slog.ErrorContext(r.Context(), "jobs reserve", "worker_id", wk.ID, "err", err)
 		writeError(w, http.StatusInternalServerError, "reserve_failed", err.Error())
 		return
 	}
+	slog.InfoContext(r.Context(), "jobs reserved", "worker_id", wk.ID, "requested", req.Batch, "granted", len(leased))
 	out := reserveResp{Jobs: make([]reserveJobDTO, 0, len(leased))}
 	for _, lj := range leased {
 		out.Jobs = append(out.Jobs, reserveJobDTO{
@@ -199,9 +202,13 @@ func (h *JobsHandler) Result(w http.ResponseWriter, r *http.Request) {
 		DiscoveredLinks: links,
 	})
 	if err != nil {
+		slog.WarnContext(r.Context(), "jobs result rejected", "err", err)
 		writeError(w, http.StatusConflict, "result_failed", err.Error())
 		return
 	}
+	slog.InfoContext(r.Context(), "jobs result accepted",
+		"lake_object_id", id, "http_status", meta.HTTPStatus,
+		"ct", meta.ContentType, "size", meta.Size, "links", len(links))
 	writeJSON(w, http.StatusOK, map[string]any{"lake_object_id": id, "accepted": true})
 }
 
@@ -217,9 +224,12 @@ func (h *JobsHandler) Fail(w http.ResponseWriter, r *http.Request) {
 		ErrorMessage: req.ErrorMessage, Retryable: req.Retryable,
 	})
 	if err != nil {
+		slog.WarnContext(r.Context(), "jobs fail rejected", "err", err)
 		writeError(w, http.StatusConflict, "fail_failed", err.Error())
 		return
 	}
+	slog.InfoContext(r.Context(), "jobs failure recorded",
+		"http_status", req.HTTPStatus, "code", req.ErrorCode, "retryable", req.Retryable)
 	writeJSON(w, http.StatusOK, map[string]any{"recorded": true})
 }
 

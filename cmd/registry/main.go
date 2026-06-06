@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,6 +36,7 @@ import (
 	httpapi "github.com/atvirokodosprendimai/crawlerv3/internal/infra/http"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/embedclient"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/lease"
+	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/logx"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/qdrant"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/store/local"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/urls"
@@ -44,6 +46,14 @@ func main() {
 	cmd := &cli.Command{
 		Name:  "registry",
 		Usage: "crawler control plane (queue, lease, blob index)",
+		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
+			lvl := c.String("log-level")
+			if c.Bool("debug") {
+				lvl = "debug"
+			}
+			logx.Init("registry", lvl)
+			return ctx, nil
+		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "db-driver", Value: "sqlite", Sources: cli.EnvVars("DB_DRIVER")},
 			&cli.StringFlag{Name: "db-dsn", Value: "crawler.db", Sources: cli.EnvVars("DB_DSN")},
@@ -52,6 +62,8 @@ func main() {
 			&cli.StringFlag{Name: "lease-secret", Sources: cli.EnvVars("LEASE_SECRET"), Usage: "HMAC secret (base64, >=16 bytes raw)"},
 			&cli.Int64Flag{Name: "max-body-bytes", Value: 200 * 1024 * 1024, Sources: cli.EnvVars("MAX_BODY_BYTES")},
 			&cli.BoolFlag{Name: "debug", Sources: cli.EnvVars("DEBUG")},
+			&cli.StringFlag{Name: "log-level", Value: "info", Sources: cli.EnvVars("LOG_LEVEL"),
+				Usage: "debug | info | warn | error"},
 
 			// Qdrant vector store (slice 10) — optional.
 			&cli.StringFlag{Name: "qdrant-url", Sources: cli.EnvVars("QDRANT_URL"),
@@ -181,7 +193,7 @@ func main() {
 		},
 	}
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
-		fmt.Fprintln(os.Stderr, "registry:", err)
+		slog.Error("registry exit", "err", err)
 		os.Exit(1)
 	}
 }
@@ -329,12 +341,12 @@ func actionServe(ctx context.Context, cmd *cli.Command) error {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-stop
-		fmt.Println("registry: shutdown signal")
+		slog.Info("shutdown signal received")
 		shCtx, sCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer sCancel()
 		_ = srv.Shutdown(shCtx)
 	}()
-	fmt.Printf("registry: listening on %s\n", srv.Addr)
+	slog.Info("listening", "addr", srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
@@ -350,22 +362,22 @@ func sweeper(ctx context.Context, svc *app.Service, embed *app.EmbedSvc, tasks *
 			return
 		case <-t.C:
 			if n, err := svc.SweepExpiredLeases(ctx); err != nil {
-				fmt.Fprintln(os.Stderr, "sweeper frontier:", err)
+				slog.Error("sweep frontier", "err", err)
 			} else if n > 0 {
-				fmt.Printf("sweeper: requeued %d stuck frontier leases\n", n)
+				slog.Info("sweep frontier", "requeued", n)
 			}
 			if embed != nil {
 				if n, err := embed.SweepExpired(ctx); err != nil {
-					fmt.Fprintln(os.Stderr, "sweeper chunks:", err)
+					slog.Error("sweep chunks", "err", err)
 				} else if n > 0 {
-					fmt.Printf("sweeper: requeued %d stuck chunk leases\n", n)
+					slog.Info("sweep chunks", "requeued", n)
 				}
 			}
 			if tasks != nil {
 				if n, err := tasks.SweepExpired(ctx); err != nil {
-					fmt.Fprintln(os.Stderr, "sweeper tasks:", err)
+					slog.Error("sweep tasks", "err", err)
 				} else if n > 0 {
-					fmt.Printf("sweeper: requeued %d stuck task leases\n", n)
+					slog.Info("sweep tasks", "requeued", n)
 				}
 			}
 		}

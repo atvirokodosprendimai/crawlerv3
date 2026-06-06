@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	"github.com/atvirokodosprendimai/crawlerv3/internal/app"
@@ -92,9 +93,12 @@ func (h *EmbedHandler) Reserve(w http.ResponseWriter, r *http.Request) {
 	}
 	leased, err := h.Svc.Reserve(r.Context(), wk.ID, effBatch)
 	if err != nil {
+		slog.ErrorContext(r.Context(), "embed reserve", "worker_id", wk.ID, "err", err)
 		writeError(w, http.StatusInternalServerError, "reserve_failed", err.Error())
 		return
 	}
+	slog.InfoContext(r.Context(), "embed reserved",
+		"worker_id", wk.ID, "requested", req.Batch, "granted", len(leased))
 	out := embedReserveResp{Chunks: make([]embedChunkDTO, 0, len(leased))}
 	for _, lc := range leased {
 		out.Chunks = append(out.Chunks, embedChunkDTO{
@@ -142,6 +146,8 @@ func (h *EmbedHandler) Result(w http.ResponseWriter, r *http.Request) {
 			firstErr = err.Error()
 		}
 	}
+	slog.InfoContext(r.Context(), "embed results",
+		"accepted", ok, "failed_recorded", failed, "total", len(req.Results))
 	resp := map[string]any{"accepted": ok, "failed_recorded": failed}
 	if firstErr != "" {
 		resp["first_error"] = firstErr

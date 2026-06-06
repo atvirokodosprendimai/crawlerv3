@@ -29,6 +29,7 @@ func Router(
 ) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
+	r.Use(AccessLog)
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.Timeout(60 * time.Second))
 

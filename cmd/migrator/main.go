@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 
 	cli "github.com/urfave/cli/v3"
@@ -14,6 +15,7 @@ import (
 	"github.com/atvirokodosprendimai/crawlerv3/internal/domain/lake"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/db/gormrepo"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/db/rwdb"
+	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/logx"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/store/local"
 	s3store "github.com/atvirokodosprendimai/crawlerv3/internal/infra/store/s3"
 )
@@ -41,11 +43,17 @@ func main() {
 
 			&cli.IntFlag{Name: "batch", Value: 100},
 			&cli.BoolFlag{Name: "delete-src", Usage: "delete source blob after successful copy"},
+			&cli.StringFlag{Name: "log-level", Value: "info", Sources: cli.EnvVars("LOG_LEVEL"),
+				Usage: "debug | info | warn | error"},
+		},
+		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
+			logx.Init("migrator", c.String("log-level"))
+			return ctx, nil
 		},
 		Action: run,
 	}
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
-		fmt.Fprintln(os.Stderr, "migrator:", err)
+		slog.Error("migrator exit", "err", err)
 		os.Exit(1)
 	}
 }
@@ -81,8 +89,11 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("migrator: scanned=%d copied=%d skipped=%d errors=%d\n",
-		stats.Scanned, stats.Copied, stats.Skipped, stats.Errors)
+	slog.Info("migration done",
+		"scanned", stats.Scanned,
+		"copied", stats.Copied,
+		"skipped", stats.Skipped,
+		"errors", stats.Errors)
 	return nil
 }
 

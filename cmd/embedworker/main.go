@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -25,6 +26,8 @@ import (
 	"time"
 
 	cli "github.com/urfave/cli/v3"
+
+	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/logx"
 )
 
 func main() {
@@ -48,11 +51,17 @@ func main() {
 			&cli.StringFlag{Name: "extract-cmd", Sources: cli.EnvVars("EXTRACT_CMD"),
 				Usage: "shell command; receives chunk text on stdin, must emit {\"embedding\":[...]} on stdout"},
 			&cli.DurationFlag{Name: "exec-timeout", Value: 60 * time.Second},
+			&cli.StringFlag{Name: "log-level", Value: "info", Sources: cli.EnvVars("LOG_LEVEL"),
+				Usage: "debug | info | warn | error"},
+		},
+		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
+			logx.Init("embedworker", c.String("log-level"))
+			return ctx, nil
 		},
 		Action: run,
 	}
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
-		fmt.Fprintln(os.Stderr, "embedworker:", err)
+		slog.Error("embedworker exit", "err", err)
 		os.Exit(1)
 	}
 }
@@ -83,7 +92,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	defer cancel()
 	go func() {
 		<-stop
-		fmt.Println("embedworker: stopping")
+		slog.Info("stopping")
 		cancel()
 	}()
 
@@ -118,25 +127,27 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	api := &http.Client{Timeout: 60 * time.Second}
+	slog.Info("embedworker started", "registry", registry, "batch", batch)
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 		if !deadline.IsZero() && time.Now().After(deadline) {
-			fmt.Println("embedworker: max-runtime reached")
+			slog.Info("max-runtime reached")
 			return nil
 		}
 		chunks, err := reserveBatch(ctx, api, registry, pat, batch)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "reserve:", err)
+			slog.Error("reserve", "err", err)
 			sleep(ctx, idle)
 			continue
 		}
 		if len(chunks) == 0 {
+			slog.Debug("reserve empty, idling")
 			sleep(ctx, idle)
 			continue
 		}
-		fmt.Printf("embedworker: leased %d chunks\n", len(chunks))
+		slog.Info("batch reserved", "n", len(chunks))
 		results := make([]map[string]any, 0, len(chunks))
 		for _, c := range chunks {
 			vec, err := e.Embed(ctx, c.Text)
@@ -153,7 +164,9 @@ func run(ctx context.Context, cmd *cli.Command) error {
 			})
 		}
 		if err := postResults(ctx, api, registry, pat, results); err != nil {
-			fmt.Fprintln(os.Stderr, "post:", err)
+			slog.Error("post", "err", err)
+		} else {
+			slog.Info("batch done", "n", len(results))
 		}
 	}
 }

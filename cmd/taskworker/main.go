@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -38,6 +39,8 @@ import (
 	"time"
 
 	cli "github.com/urfave/cli/v3"
+
+	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/logx"
 )
 
 func main() {
@@ -63,11 +66,17 @@ func main() {
 			&cli.DurationFlag{Name: "exec-timeout", Value: 5 * time.Minute},
 			&cli.DurationFlag{Name: "heartbeat-interval", Value: 30 * time.Second,
 				Usage: "POST /v1/tasks/heartbeat every N to keep lease alive during long jobs (0 disables)"},
+			&cli.StringFlag{Name: "log-level", Value: "info", Sources: cli.EnvVars("LOG_LEVEL"),
+				Usage: "debug | info | warn | error"},
+		},
+		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
+			logx.Init("task-worker", c.String("log-level"))
+			return ctx, nil
 		},
 		Action: run,
 	}
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
-		fmt.Fprintln(os.Stderr, "task-worker:", err)
+		slog.Error("task-worker exit", "err", err)
 		os.Exit(1)
 	}
 }
@@ -93,7 +102,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-stop
-		fmt.Println("task-worker: stopping")
+		slog.Info("stopping")
 		os.Exit(0)
 	}()
 
@@ -123,21 +132,27 @@ func run(ctx context.Context, cmd *cli.Command) error {
 
 	sem := make(chan struct{}, conc)
 
+	slog.Info("task-worker started",
+		"registry", registry, "kinds", kinds, "batch", batch, "concurrency", conc,
+		"exec_timeout", execTO.String(), "heartbeat_interval", hbInterval.String())
+
 	for {
 		if !deadline.IsZero() && time.Now().After(deadline) {
-			fmt.Println("task-worker: max-runtime reached, exiting")
+			slog.Info("max-runtime reached, exiting")
 			return nil
 		}
 		tasks, err := reserve(ctx, c, registry, pat, kinds, batch)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "reserve:", err)
+			slog.Error("reserve", "err", err)
 			time.Sleep(idle)
 			continue
 		}
 		if len(tasks) == 0 {
+			slog.Debug("reserve empty, idling", "sleep", idle.String())
 			time.Sleep(idle)
 			continue
 		}
+		slog.Info("batch reserved", "n", len(tasks))
 		var wg sync.WaitGroup
 		for _, t := range tasks {
 			wg.Add(1)
@@ -174,8 +189,9 @@ func reserve(ctx context.Context, c *http.Client, registry, pat string, kinds []
 }
 
 func workOne(ctx context.Context, c *http.Client, registry, pat string, t task, mode, extractCmd, outputGlob, outputCT, nextProc string, execTO, hbInterval time.Duration) {
-	fmt.Printf("task-worker: task=%d processor=%s blob=%s size=%d\n",
-		t.TaskID, t.Processor, t.BlobURL, t.BlobSizeBytes)
+	log := slog.With("task_id", t.TaskID, "processor", t.Processor)
+	start := time.Now()
+	log.Info("task start", "blob", t.BlobURL, "size", t.BlobSizeBytes, "attempt", t.AttemptCount)
 
 	scratch, err := os.MkdirTemp("", "taskworker-*")
 	if err != nil {
@@ -219,8 +235,10 @@ func workOne(ctx context.Context, c *http.Client, registry, pat string, t task, 
 	switch mode {
 	case "text":
 		if err := postResultText(ctx, c, registry, pat, t.TaskID, t.LeaseToken, stdout.String()); err != nil {
-			fmt.Fprintln(os.Stderr, "post text:", err)
+			log.Error("post text", "err", err)
+			return
 		}
+		log.Info("task ok", "mode", "text", "text_bytes", stdout.Len(), "dur_ms", time.Since(start).Milliseconds())
 	case "blob":
 		matches, _ := filepath.Glob(strings.ReplaceAll(outputGlob, "{outdir}", outdir))
 		if len(matches) == 0 {
@@ -228,8 +246,10 @@ func workOne(ctx context.Context, c *http.Client, registry, pat string, t task, 
 			return
 		}
 		if err := postResultBlob(ctx, c, registry, pat, t.TaskID, t.LeaseToken, matches[0], outputCT, nextProc); err != nil {
-			fmt.Fprintln(os.Stderr, "post blob:", err)
+			log.Error("post blob", "err", err)
+			return
 		}
+		log.Info("task ok", "mode", "blob", "output", matches[0], "next_processor", nextProc, "dur_ms", time.Since(start).Milliseconds())
 	default:
 		postFail(ctx, c, registry, pat, t, "bad_mode", "mode must be text or blob", false)
 	}
@@ -349,13 +369,15 @@ func heartbeatLoop(ctx context.Context, c *http.Client, registry, pat string, ta
 			resp, err := c.Do(req)
 			if err != nil {
 				if ctx.Err() == nil {
-					fmt.Fprintf(os.Stderr, "heartbeat task=%d: %v\n", taskID, err)
+					slog.Warn("heartbeat", "task_id", taskID, "err", err)
 				}
 				continue
 			}
 			if resp.StatusCode != http.StatusOK {
 				b, _ := io.ReadAll(resp.Body)
-				fmt.Fprintf(os.Stderr, "heartbeat task=%d: status=%d body=%s\n", taskID, resp.StatusCode, string(b))
+				slog.Warn("heartbeat", "task_id", taskID, "status", resp.StatusCode, "body", string(b))
+			} else {
+				slog.Debug("heartbeat ok", "task_id", taskID)
 			}
 			resp.Body.Close()
 		}
@@ -375,10 +397,11 @@ func postFail(ctx context.Context, c *http.Client, registry, pat string, t task,
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.Do(req)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "post fail:", err)
+		slog.Error("post fail", "task_id", t.TaskID, "code", code, "err", err)
 		return
 	}
 	resp.Body.Close()
+	slog.Warn("task failed", "task_id", t.TaskID, "code", code, "msg", msg, "retryable", retryable)
 }
 
 func extFor(ct string) string {
