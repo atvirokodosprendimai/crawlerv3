@@ -7,3 +7,8 @@
 - 2026-06-06 `986871d` slice 13: db capabilities catalog
 - 2026-06-06 `6e1a445` cleanup: drop legacy Pipeline.EnqueueFor routing
 - 2026-06-06 `c2c236c` examples: refresh CLI commands for slice 13 catalog
+- 2026-06-06 `dd93b41` merge: worker --concurrency goroutine pool
+- 2026-06-06 `b832638` feat(logging): structured slog across binaries + HTTP access log
+- 2026-06-06 `97a4811` feat(ocrworker): PDF OCR task worker (mutool+gs+tesseract page-parallel)
+- 2026-06-06 `6fb6548` feat(fts): symmetric Stanza→Quickwit pipeline + /v1/search/fts
+- 2026-06-06 `635c6d4` feat(embedworker): load-balanced Ollama fleet with batched /api/embed

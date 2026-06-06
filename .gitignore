@@ -4,3 +4,4 @@ blobs
 /golang
 __pycache__/
 *.pyc
+tmp
