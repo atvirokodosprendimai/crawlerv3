@@ -161,6 +161,13 @@ func (h *JobsHandler) Result(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_multipart", err.Error())
 		return
 	}
+	// Parts larger than 1MB are spooled to /tmp/multipart-* — net/http does
+	// not auto-clean. Remove on handler return.
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
 	metaStr := r.FormValue("meta")
 	if metaStr == "" {
 		writeError(w, http.StatusBadRequest, "missing_meta", "meta field required")
