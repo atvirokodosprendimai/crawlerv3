@@ -33,6 +33,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -48,6 +49,8 @@ func main() {
 			&cli.StringFlag{Name: "pat", Required: true, Sources: cli.EnvVars("PAT")},
 			&cli.StringSliceFlag{Name: "kind", Required: true, Usage: "task kinds to claim (e.g. pdf_ocr); repeatable"},
 			&cli.IntFlag{Name: "batch", Value: 4},
+			&cli.IntFlag{Name: "concurrency", Value: 2,
+				Usage: "max parallel tasks per reserved batch"},
 			&cli.DurationFlag{Name: "idle-sleep", Value: 5 * time.Second},
 			&cli.DurationFlag{Name: "max-runtime", Value: 0, Usage: "exit after this duration; 0 = run forever"},
 			&cli.StringFlag{Name: "mode", Value: "text", Usage: "text | blob"},
@@ -103,6 +106,10 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	pat := cmd.String("pat")
 	kinds := cmd.StringSlice("kind")
 	batch := cmd.Int("batch")
+	conc := cmd.Int("concurrency")
+	if conc < 1 {
+		conc = 1
+	}
 	idle := cmd.Duration("idle-sleep")
 	mode := cmd.String("mode")
 	extractCmd := cmd.String("extract-cmd")
@@ -113,6 +120,8 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	hbInterval := cmd.Duration("heartbeat-interval")
 
 	c := &http.Client{Timeout: 60 * time.Second}
+
+	sem := make(chan struct{}, conc)
 
 	for {
 		if !deadline.IsZero() && time.Now().After(deadline) {
@@ -129,9 +138,17 @@ func run(ctx context.Context, cmd *cli.Command) error {
 			time.Sleep(idle)
 			continue
 		}
+		var wg sync.WaitGroup
 		for _, t := range tasks {
-			workOne(ctx, c, registry, pat, t, mode, extractCmd, outputGlob, outputCT, nextProc, execTO, hbInterval)
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(t task) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				workOne(ctx, c, registry, pat, t, mode, extractCmd, outputGlob, outputCT, nextProc, execTO, hbInterval)
+			}(t)
 		}
+		wg.Wait()
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,6 +36,8 @@ func main() {
 			&cli.StringFlag{Name: "registry", Required: true, Sources: cli.EnvVars("REGISTRY")},
 			&cli.StringFlag{Name: "pat", Required: true, Sources: cli.EnvVars("PAT")},
 			&cli.IntFlag{Name: "batch", Value: 10},
+			&cli.IntFlag{Name: "concurrency", Value: 4,
+				Usage: "max parallel fetches per reserved batch"},
 			&cli.DurationFlag{Name: "idle-sleep", Value: 3 * time.Second},
 			&cli.DurationFlag{Name: "fetch-timeout", Value: 30 * time.Second},
 			&cli.StringFlag{Name: "user-agent", Value: "crawlerv3-worker/0.1"},
@@ -90,12 +93,18 @@ func runLoop(ctx context.Context, cmd *cli.Command) error {
 	registry := strings.TrimRight(cmd.String("registry"), "/")
 	pat := cmd.String("pat")
 	batch := cmd.Int("batch")
+	conc := cmd.Int("concurrency")
+	if conc < 1 {
+		conc = 1
+	}
 	idle := cmd.Duration("idle-sleep")
 	fetchTO := cmd.Duration("fetch-timeout")
 	ua := cmd.String("user-agent")
 
 	httpc := &http.Client{Timeout: fetchTO}
 	apic := &http.Client{Timeout: 30 * time.Second}
+
+	sem := make(chan struct{}, conc)
 
 	for {
 		jobs, err := reserve(ctx, apic, registry, pat, batch)
@@ -108,9 +117,17 @@ func runLoop(ctx context.Context, cmd *cli.Command) error {
 			time.Sleep(idle)
 			continue
 		}
+		var wg sync.WaitGroup
 		for _, j := range jobs {
-			handleJob(ctx, httpc, apic, registry, pat, ua, j)
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(j job) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				handleJob(ctx, httpc, apic, registry, pat, ua, j)
+			}(j)
 		}
+		wg.Wait()
 	}
 }
 
