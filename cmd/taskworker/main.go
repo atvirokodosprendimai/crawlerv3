@@ -58,6 +58,8 @@ func main() {
 			&cli.StringFlag{Name: "output-content-type", Value: "application/octet-stream"},
 			&cli.StringFlag{Name: "next-processor", Value: "", Usage: "follow-up processor for blob mode (e.g. pdf_ocr)"},
 			&cli.DurationFlag{Name: "exec-timeout", Value: 5 * time.Minute},
+			&cli.DurationFlag{Name: "heartbeat-interval", Value: 30 * time.Second,
+				Usage: "POST /v1/tasks/heartbeat every N to keep lease alive during long jobs (0 disables)"},
 		},
 		Action: run,
 	}
@@ -108,6 +110,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	outputCT := cmd.String("output-content-type")
 	nextProc := cmd.String("next-processor")
 	execTO := cmd.Duration("exec-timeout")
+	hbInterval := cmd.Duration("heartbeat-interval")
 
 	c := &http.Client{Timeout: 60 * time.Second}
 
@@ -127,7 +130,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 			continue
 		}
 		for _, t := range tasks {
-			workOne(ctx, c, registry, pat, t, mode, extractCmd, outputGlob, outputCT, nextProc, execTO)
+			workOne(ctx, c, registry, pat, t, mode, extractCmd, outputGlob, outputCT, nextProc, execTO, hbInterval)
 		}
 	}
 }
@@ -153,7 +156,7 @@ func reserve(ctx context.Context, c *http.Client, registry, pat string, kinds []
 	return rr.Tasks, nil
 }
 
-func workOne(ctx context.Context, c *http.Client, registry, pat string, t task, mode, extractCmd, outputGlob, outputCT, nextProc string, execTO time.Duration) {
+func workOne(ctx context.Context, c *http.Client, registry, pat string, t task, mode, extractCmd, outputGlob, outputCT, nextProc string, execTO, hbInterval time.Duration) {
 	fmt.Printf("task-worker: task=%d processor=%s blob=%s size=%d\n",
 		t.TaskID, t.Processor, t.BlobURL, t.BlobSizeBytes)
 
@@ -174,6 +177,12 @@ func workOne(ctx context.Context, c *http.Client, registry, pat string, t task, 
 	if err := os.MkdirAll(outdir, 0o755); err != nil {
 		postFail(ctx, c, registry, pat, t, "outdir", err.Error(), true)
 		return
+	}
+
+	hbCtx, hbCancel := context.WithCancel(ctx)
+	defer hbCancel()
+	if hbInterval > 0 {
+		go heartbeatLoop(hbCtx, c, registry, pat, t.TaskID, t.LeaseToken, hbInterval)
 	}
 
 	cmdStr := strings.NewReplacer("{input}", input, "{outdir}", outdir).Replace(extractCmd)
@@ -303,6 +312,37 @@ func postResultBlob(ctx context.Context, c *http.Client, registry, pat string, t
 		return fmt.Errorf("result blob status=%d body=%s", resp.StatusCode, string(b))
 	}
 	return nil
+}
+
+func heartbeatLoop(ctx context.Context, c *http.Client, registry, pat string, taskID int64, leaseToken string, interval time.Duration) {
+	tk := time.NewTicker(interval)
+	defer tk.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tk.C:
+			body, _ := json.Marshal(map[string]any{
+				"task_id":     taskID,
+				"lease_token": leaseToken,
+			})
+			req, _ := http.NewRequestWithContext(ctx, "POST", registry+"/v1/tasks/heartbeat", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+pat)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := c.Do(req)
+			if err != nil {
+				if ctx.Err() == nil {
+					fmt.Fprintf(os.Stderr, "heartbeat task=%d: %v\n", taskID, err)
+				}
+				continue
+			}
+			if resp.StatusCode != http.StatusOK {
+				b, _ := io.ReadAll(resp.Body)
+				fmt.Fprintf(os.Stderr, "heartbeat task=%d: status=%d body=%s\n", taskID, resp.StatusCode, string(b))
+			}
+			resp.Body.Close()
+		}
+	}
 }
 
 func postFail(ctx context.Context, c *http.Client, registry, pat string, t task, code, msg string, retryable bool) {

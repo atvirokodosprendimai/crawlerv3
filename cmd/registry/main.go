@@ -75,6 +75,10 @@ func main() {
 					Usage: "auto-add any newly discovered host (default: drop external links)"},
 				&cli.IntFlag{Name: "max-depth", Sources: cli.EnvVars("MAX_DEPTH"),
 					Usage: "drop discovered links beyond this depth (0 = unlimited)"},
+				&cli.DurationFlag{Name: "lease-ttl", Value: 10 * time.Minute, Sources: cli.EnvVars("LEASE_TTL"),
+					Usage: "how long a reserved job/task lease is valid before it can be re-leased"},
+				&cli.DurationFlag{Name: "heartbeat-extend", Value: 60 * time.Second, Sources: cli.EnvVars("HEARTBEAT_EXTEND"),
+					Usage: "how much each successful heartbeat extends the lease"},
 			}, Action: actionServe},
 			{Name: "migrate", Usage: "run migrations", Commands: []*cli.Command{
 				{Name: "up", Action: migrateAction("up")},
@@ -252,6 +256,12 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 	if md := cmd.Int("max-depth"); md > 0 {
 		cfg.MaxDepth = md
 	}
+	if d := cmd.Duration("lease-ttl"); d > 0 {
+		cfg.LeaseTTL = d
+	}
+	if d := cmd.Duration("heartbeat-extend"); d > 0 {
+		cfg.HeartbeatExtend = d
+	}
 	svc := app.New(cfg, frepo, frepo, lrepo, blobs, wrepo, signer)
 	pipe := app.NewPipeline(lrepo, blobs, prepo, erepo, crepo)
 	svc.SetPipeline(pipe)
@@ -259,8 +269,8 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 	svc.SetDispatcher(disp)
 	resolver := app.NewCollectionResolver(lrepo, frepo, frepo)
 	pipe.SetResolver(resolver)
-	embed := app.NewEmbedSvc(app.Defaults(), crepo, signer)
-	tasks := app.NewTaskSvc(app.Defaults(), prepo, lrepo, blobs, erepo, signer)
+	embed := app.NewEmbedSvc(cfg, crepo, signer)
+	tasks := app.NewTaskSvc(cfg, prepo, lrepo, blobs, erepo, signer)
 	tasks.AttachChunkSink(&app.ChunkRepoSink{Repo: crepo})
 	tasks.SetDispatcher(disp)
 	tasks.SetResolver(resolver)

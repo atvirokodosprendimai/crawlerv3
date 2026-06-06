@@ -22,8 +22,8 @@ import (
 
 // Config holds tunables shared by all use cases.
 type Config struct {
-	LeaseTTL         time.Duration // default 60s
-	HeartbeatExtend  time.Duration // default 60s
+	LeaseTTL         time.Duration // default 10m (overridable via registry --lease-ttl / LEASE_TTL)
+	HeartbeatExtend  time.Duration // default 60s (overridable via registry --heartbeat-extend / HEARTBEAT_EXTEND)
 	DefaultBatch     int           // default 10
 	DefaultBackoff   time.Duration // base for exponential backoff, default 30s
 	MaxBackoff       time.Duration // cap, default 24h
@@ -37,7 +37,7 @@ type Config struct {
 // only. Operators that want unrestricted recursion can set AllowAutoDomains=true.
 func Defaults() Config {
 	return Config{
-		LeaseTTL:         60 * time.Second,
+		LeaseTTL:         600 * time.Second,
 		HeartbeatExtend:  60 * time.Second,
 		DefaultBatch:     10,
 		DefaultBackoff:   30 * time.Second,
