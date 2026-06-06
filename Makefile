@@ -2,7 +2,7 @@ BINDIR := ./bin
 
 .PHONY: build registry worker migrator clean
 
-build: registry worker migrator taskworker agent embedworker
+build: registry worker migrator taskworker agent embedworker ocrworker
 
 registry:
 	@mkdir -p $(BINDIR)
@@ -28,6 +28,10 @@ agent:
 taskworker:
 	@mkdir -p $(BINDIR)
 	go build -o $(BINDIR)/taskworker ./cmd/taskworker
+
+ocrworker:
+	@mkdir -p $(BINDIR)
+	go build -o $(BINDIR)/ocrworker ./cmd/ocrworker
 
 clean:
 	rm -rf $(BINDIR)
