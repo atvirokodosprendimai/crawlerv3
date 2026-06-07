@@ -34,7 +34,7 @@ func (r *FrontierRepo) UpsertByHost(ctx context.Context, host, scheme string, cr
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return frontier.DomainRow{}, err
 	}
-	d := Domain{Host: host, Scheme: scheme, IsActive: true, CrawlDelayMS: crawlDelayMS, CreatedAt: time.Now().UTC()}
+	d := Domain{Host: host, Scheme: scheme, IsActive: true, CrawlDelayMS: crawlDelayMS, ParallelFetches: 1, CreatedAt: time.Now().UTC()}
 	if err := r.DB.W.WithContext(ctx).Create(&d).Error; err != nil {
 		return frontier.DomainRow{}, err
 	}
