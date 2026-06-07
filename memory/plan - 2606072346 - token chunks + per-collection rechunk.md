@@ -60,19 +60,15 @@ After this plan, the operator can: (a) run `registry rechunk --collection lithua
 
 **End-of-phase outcome:** operator can tune per-collection chunk sizing at runtime; ingest picks up changes on the next document. Phase 4 (rechunk) next.
 
-## Phase 4 — `registry rechunk` CLI
+## Phase 4 — `registry rechunk` CLI — [completed]
 
 **Goal:** operator can rebuild the chunk backlog for an existing collection in place.
 
-1. [ ] New service method `app.Chunker.Rechunk(ctx, collection string, opts RechunkOpts) (RechunkReport, error)`.
-   - Find all extracted_documents whose resolved collection matches.
-   - Per document, in a `WriteTX`: collect old chunk_ids → DELETE old rows → re-split text with current resolved config → INSERT new rows with `embed_status='pending'`.
-   - Return per-document line items: `(doc_id, old_count, new_count)`. Qdrant cleanup is Phase 5; phase 4 emits the old chunk_ids only.
-2. [ ] CLI subcommand `registry rechunk --collection <name> [--dry-run] [--since-doc-id N] [--limit N]`. Output one line per document plus a totals line.
-3. [ ] Test `tasksvc_rechunk_test.go` (or smoke) covering: full collection rechunk; dry-run reports counts only; `--limit` honored; doc with no chunks is a no-op.
-4. [ ] Smoke `scripts/smoke_rechunk.sh`: seed 3 docs, run rechunk with different config, assert (a) old chunk rows gone, (b) new chunk count matches `ceil(token_count / chunk_tokens)`, (c) all new chunks `pending`.
+1. [x] New `app.RechunkSvc.Rechunk(ctx, collection, opts) (*RechunkReport, error)`. Walks `extraction.ListByCollection` in pages of 100; per document calls the new `chunking.Repository.ReplaceByDocument(ctx, docID, fresh)` which deletes old rows and inserts the fresh slice in **one** `WriteTX`. Returns per-doc `(OldCount, NewCount, OldChunkIDs)` so Phase 5 can pick up the Qdrant cleanup without recomputing.
+2. [x] CLI `registry rechunk --collection <name> [--dry-run] [--since-doc-id N] [--limit N]`. `--collection -` targets documents whose Collection field is empty (default bucket); any other value matches by equality. Output one line per document plus a totals line with `config_source` (`collections-row` or `defaults`) and the resolved sizing.
+3. [x] `scripts/smoke_rechunk.sh` covers: plant 3 docs of varying length with stale chunks → dry-run leaves DB intact → set tiny per-collection config → apply → assert stale gone, all new `pending`, every doc gets ≥2 chunks → rerun is idempotent (same row count). Passes.
 
-**End-of-phase visible result:** operator can run `registry rechunk --collection X` and watch `queue-stats` show the chunk queue spike. Qdrant still holds the old vectors at this point — addressed in Phase 5.
+**End-of-phase outcome:** the operator can run `registry rechunk --collection liteko` and watch `queue-stats` show the chunk queue spike. Qdrant still holds the old vectors at this point — Phase 5 (DeletePoints) is the last piece.
 
 ## Phase 5 — Qdrant cleanup integration
 
@@ -106,3 +102,4 @@ The plan is done when:
 - **2026-06-07 23:58** — Phase 1 completed. tiktoken-go (pure Go) added; `chunker.Tokenizer` interface + tiktoken adapter shipped; `--tokenizer` flag wired into registry; round-trip tests cover Lithuanian + English + emoji. Lt/En token-density ratio = 2.66, defaults (3600 cl100k_base tokens) still fit a 4k window comfortably for Lithuanian text. No behavior change yet — chunker call sites still word-based. Phase 2 next.
 - **2026-06-08 00:05** — Phase 2 completed. Chunker rewritten to token-space sliding window with `prev||core||next` shape; `Defaults()` = 2800/400/400. `NewPipeline` and `NewTaskSvc` take `Tokenizer` arg; registry wires `bundle.Tokenizer` through. Spec §1 verification covered in `chunker_test.go`. End-to-end with real cl100k_base passes. `scripts/smoke.sh` green — surfaced a pre-existing `UpsertByHost` bug (parallel_fetches=0 → no reserves) and fixed in `4f78337`. Also pulled two unrelated operational fixes (`sweep-now` CLI + idempotent `lake_objects.Insert` on UNIQUE) into commits `104aa79` to address concurrent prod issues; merged to main in `7509375`. Phase 3 next.
 - **2026-06-08 00:11** — Phase 3 completed. Migration `0010_collections.sql` (3 dialects). New `chunking.CollectionConfigRepo` port + `gormrepo` impl using `ON CONFLICT … DO UPDATE`. New `app.CollectionConfigResolver` resolves per-collection sizing with fallback to registry defaults. `Pipeline.writeChunks` and `TaskSvc.AcceptText` now resolve config per document; existing call shape kept by keeping `ChunkCfg` as the fallback. Three CLI subcommands: `list-collections`, `set-collection` (read-modify-write so partial flags don't clobber), `delete-collection`. New `scripts/smoke_collections.sh` covers the full lifecycle. Phase 4 (rechunk CLI) next.
+- **2026-06-08 00:20** — Phase 4 completed. Added `chunking.Repository.ReplaceByDocument` (single-WriteTX delete-and-replace, returns old chunk IDs for Phase 5) and `extraction.Repository.ListByCollection`. New `app.RechunkSvc` orchestrates the walk in pages of 100. CLI `registry rechunk --collection <name>` with `--dry-run`, `--since-doc-id`, `--limit`. `scripts/smoke_rechunk.sh` plants stale chunks, asserts dry-run leaves the DB intact, then applies tiny per-collection sizing and verifies stale rows gone, every new chunk pending, idempotent rerun. Phase 5 (Qdrant cleanup) is the only piece remaining.

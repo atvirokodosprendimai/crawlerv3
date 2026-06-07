@@ -40,6 +40,61 @@ func (r *ChunkRepo) InsertMany(ctx context.Context, chunks []chunking.Chunk) err
 		Create(&rows).Error
 }
 
+// ReplaceByDocument deletes every document_chunks row attached to documentID
+// and inserts the provided fresh slice in one WriteTX. Returns the old chunk
+// IDs in pre-delete order so the caller can drive a downstream Qdrant point
+// delete after the DB commit lands.
+//
+// Used by the rechunk operator command. The DB transaction guarantees a
+// crash mid-document leaves the row set in either fully-old or fully-new
+// state, never a mix. If fresh is empty, the document ends up with no
+// chunks (legal — document.Text might have been emptied externally).
+func (r *ChunkRepo) ReplaceByDocument(ctx context.Context, documentID int64, fresh []chunking.Chunk) ([]string, error) {
+	var oldIDs []string
+	err := r.DB.WriteTX(ctx, func(tx *rwdb.Tx) error {
+		// Collect old IDs for the Qdrant cleanup hand-off.
+		var ids []string
+		if err := tx.Model(&DocumentChunk{}).
+			Where("document_id = ?", documentID).
+			Order("chunk_index ASC").
+			Pluck("id", &ids).Error; err != nil {
+			return fmt.Errorf("rechunk: list old ids: %w", err)
+		}
+		// Delete in one go — same transaction so concurrent embed reserves
+		// cannot pick up a chunk that is about to disappear.
+		if err := tx.Where("document_id = ?", documentID).
+			Delete(&DocumentChunk{}).Error; err != nil {
+			return fmt.Errorf("rechunk: delete old: %w", err)
+		}
+		oldIDs = ids
+		if len(fresh) == 0 {
+			return nil
+		}
+		rows := make([]DocumentChunk, 0, len(fresh))
+		now := time.Now().UTC()
+		for _, c := range fresh {
+			rows = append(rows, DocumentChunk{
+				ID:          c.ID,
+				DocumentID:  c.DocumentID,
+				ChunkIndex:  c.ChunkIndex,
+				Text:        c.Text,
+				TokenCount:  c.TokenCount,
+				EmbedStatus: string(chunking.EmbedPending),
+				CreatedAt:   now,
+			})
+		}
+		if err := tx.Session(&gorm.Session{CreateBatchSize: 500}).
+			Create(&rows).Error; err != nil {
+			return fmt.Errorf("rechunk: insert new: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return oldIDs, nil
+}
+
 // ReserveBatch leases up to batch chunks for the embed worker.
 // Each returned chunk carries its source document's collection (from
 // extracted_documents.collection); empty when no per-domain hint is set.

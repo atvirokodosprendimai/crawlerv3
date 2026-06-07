@@ -186,6 +186,12 @@ func main() {
 			{Name: "delete-collection", Usage: "remove a collections row; future ingest reverts to registry defaults", Flags: []cli.Flag{
 				&cli.StringFlag{Name: "name", Required: true},
 			}, Action: actionDeleteCollection},
+			{Name: "rechunk", Usage: "drop + respit every document_chunks row for a collection using its current sizing config. Use '-' for the default-collection bucket. Qdrant cleanup deferred to Phase 5.", Flags: []cli.Flag{
+				&cli.StringFlag{Name: "collection", Required: true, Usage: "collection name to rebuild; '-' targets documents with empty collection"},
+				&cli.BoolFlag{Name: "dry-run", Usage: "report planned new chunk counts only, no writes"},
+				&cli.IntFlag{Name: "since-doc-id", Value: 0, Usage: "skip documents whose id <= N (incremental runs)"},
+				&cli.IntFlag{Name: "limit", Value: 0, Usage: "cap the number of documents processed (0 = no cap)"},
+			}, Action: actionRechunk},
 			{Name: "activate-domain", Usage: "set is_active=1 for a domain", Flags: []cli.Flag{
 				&cli.StringFlag{Name: "host", Required: true},
 			}, Action: actionActivateDomain(true)},
@@ -288,6 +294,7 @@ type registryBundle struct {
 	Tokenizer       chunker.Tokenizer         // wired in Phase 1; chunker consumes it in Phase 2
 	Collections     *gormrepo.CollectionConfigRepo
 	CollectionsCfg  *app.CollectionConfigResolver
+	Rechunk         *app.RechunkSvc
 }
 
 func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
@@ -339,6 +346,7 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 	defaults.Tok = tok
 	cfgResolver := app.NewCollectionConfigResolver(ccrepo, defaults)
 	pipe.SetConfigResolver(cfgResolver)
+	rechunk := app.NewRechunkSvc(erepo, crepo, cfgResolver, defaults)
 	embed := app.NewEmbedSvc(cfg, crepo, signer)
 	tasks := app.NewTaskSvc(cfg, prepo, lrepo, blobs, erepo, signer, tok)
 	tasks.AttachChunkSink(&app.ChunkRepoSink{Repo: crepo})
@@ -388,6 +396,7 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 		Tokenizer:      tok,
 		Collections:    ccrepo,
 		CollectionsCfg: cfgResolver,
+		Rechunk:        rechunk,
 	}, nil
 }
 
@@ -971,6 +980,46 @@ func actionDeleteCollection(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 	fmt.Printf("collection=%s deleted\n", cmd.String("name"))
+	return nil
+}
+
+func actionRechunk(ctx context.Context, cmd *cli.Command) error {
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	b, err := buildService(cmd, db)
+	if err != nil {
+		return err
+	}
+	rep, err := b.Rechunk.Rechunk(ctx, cmd.String("collection"), app.RechunkOpts{
+		SinceDocID: int64(cmd.Int("since-doc-id")),
+		Limit:      cmd.Int("limit"),
+		DryRun:     cmd.Bool("dry-run"),
+	})
+	if err != nil {
+		return err
+	}
+	for _, d := range rep.Documents {
+		if d.Err != nil {
+			fmt.Printf("doc_id=%d ERROR: %v\n", d.DocumentID, d.Err)
+			continue
+		}
+		fmt.Printf("doc_id=%d chunks_old=%d chunks_new=%d\n", d.DocumentID, d.OldCount, d.NewCount)
+	}
+	mode := "applied"
+	if rep.DryRun {
+		mode = "dry_run"
+	}
+	source := "defaults"
+	if rep.FromTable {
+		source = "collections-row"
+	}
+	fmt.Printf("rechunk collection=%s mode=%s docs=%d chunks_old=%d chunks_new=%d errors=%d config_source=%s chunk_tokens=%d overlap_prev=%d overlap_next=%d\n",
+		rep.Collection, mode, len(rep.Documents),
+		rep.TotalOld, rep.TotalNew, rep.Errors,
+		source, rep.Config.ChunkTokens, rep.Config.OverlapPrev, rep.Config.OverlapNext)
 	return nil
 }
 
