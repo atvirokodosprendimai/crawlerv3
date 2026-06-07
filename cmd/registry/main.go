@@ -147,6 +147,9 @@ func main() {
 				&cli.IntFlag{Name: "id", Required: true},
 			}, Action: actionReleaseWorker},
 			{Name: "queue-stats", Usage: "show per-queue status counts", Action: actionQueueStats},
+			{Name: "sweep-now", Usage: "release leased crawl_frontier rows whose lease has expired (run the sweeper one-shot). Use --force to release all leased rows regardless of expiry (worker-restart recovery).", Flags: []cli.Flag{
+				&cli.BoolFlag{Name: "force", Usage: "release every status='leased' row, not just expired ones"},
+			}, Action: actionSweepNow},
 			{Name: "requeue-chunks", Usage: "bulk-requeue document_chunks rows", Flags: []cli.Flag{
 				&cli.StringFlag{Name: "status", Value: "", Usage: "embed_status filter (pending|leased|done|failed). Empty = any non-done"},
 				&cli.IntFlag{Name: "worker", Value: 0, Usage: "only chunks held by this worker_id"},
@@ -830,6 +833,38 @@ func actionRequeueTasks(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 	fmt.Printf("requeue-tasks rows=%d\n", n)
+	return nil
+}
+
+// actionSweepNow runs the lease-expiry sweeper one-shot. The serve loop calls
+// SweepExpired on its own ticker; this command is for the operator who wants
+// stuck leases released right now rather than waiting for the next tick (e.g.
+// after a worker restart left rows in 'leased' state).
+//
+// --force releases every status='leased' row, not just expired ones. Use with
+// care: it will yank work out from active workers.
+func actionSweepNow(ctx context.Context, cmd *cli.Command) error {
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	frepo := gormrepo.NewFrontierRepo(db)
+	if cmd.Bool("force") {
+		n, err := frepo.RequeueByFilter(ctx, frontier.RequeueFilter{
+			Status: frontier.StatusLeased,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("sweep-now force-released=%d\n", n)
+		return nil
+	}
+	n, err := frepo.SweepExpired(ctx, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("sweep-now released=%d\n", n)
 	return nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/atvirokodosprendimai/crawlerv3/internal/domain/lake"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/db/rwdb"
@@ -17,7 +18,14 @@ type LakeRepo struct{ DB *rwdb.DB }
 // NewLakeRepo wires a LakeRepo to the rwdb pools.
 func NewLakeRepo(db *rwdb.DB) *LakeRepo { return &LakeRepo{DB: db} }
 
-// Insert writes a lake_objects row.
+// Insert writes a lake_objects row, returning the row's ID.
+//
+// Idempotent on the UNIQUE(content_sha256, url_hash) constraint: if a row
+// with the same hash pair already exists (worker died after blob put + lake
+// insert but before frontier.Complete; sweeper requeued; another worker
+// re-fetched and got the same bytes), Insert returns the existing row's ID
+// instead of erroring. The caller's frontier.Complete then proceeds and
+// the duplicate work resolves to a no-op on the lake side.
 func (r *LakeRepo) Insert(ctx context.Context, o lake.Object) (int64, error) {
 	m := LakeObject{
 		URLHash:        o.URLHash,
@@ -35,10 +43,26 @@ func (r *LakeRepo) Insert(ctx context.Context, o lake.Object) (int64, error) {
 		mf := o.MigratedFrom
 		m.MigratedFrom = &mf
 	}
-	if err := r.DB.W.WithContext(ctx).Create(&m).Error; err != nil {
+	res := r.DB.W.WithContext(ctx).
+		Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&m)
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	if m.ID != 0 {
+		return m.ID, nil
+	}
+	// OnConflict DoNothing fired — the row already exists. Resolve to its ID
+	// so the caller's downstream Complete still has a valid lake_object_id.
+	var existing LakeObject
+	err := r.DB.R.WithContext(ctx).
+		Where("content_sha256 = ? AND url_hash = ?", o.ContentSHA256, o.URLHash).
+		Select("id").
+		First(&existing).Error
+	if err != nil {
 		return 0, err
 	}
-	return m.ID, nil
+	return existing.ID, nil
 }
 
 // FindBySHA reads from the read pool.
