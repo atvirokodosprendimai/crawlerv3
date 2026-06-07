@@ -22,24 +22,17 @@ After this plan, the operator can: (a) run `registry rechunk --collection lithua
 
 ---
 
-## Phase 1 — Tokenizer abstraction + dependency
+## Phase 1 — Tokenizer abstraction + dependency — [completed]
 
 **Goal:** plumb tokenizer support without behavior change. Chunker keeps current word-based logic; tokenizer is wired but unused.
 
-1. [ ] Add `tiktoken-go` to `go.mod`. Verify it builds on the registry box (no cgo, pure Go).
-2. [ ] Create `internal/infra/tokenizer/tiktoken/tiktoken.go` implementing a small `Tokenizer` interface:
-   ```go
-   type Tokenizer interface {
-       Name() string
-       Encode(s string) []int
-       Decode(ids []int) string
-   }
-   ```
-3. [ ] Declare the interface in `internal/infra/pipeline/chunker/tokenizer.go` (alongside `chunker.Config`).
-4. [ ] Wire a default tokenizer in `cmd/registry/main.go buildService`. Store on the bundle.
-5. [ ] Unit test: `Encode/Decode` round-trips equal string for a few Lithuanian + English samples.
+1. [x] Add `tiktoken-go` to `go.mod`. Pure Go (no cgo). Transitive: `dlclark/regexp2`.
+2. [x] `internal/infra/pipeline/chunker/tokenizer.go` declares the `Tokenizer` interface.
+3. [x] `internal/infra/tokenizer/tiktoken/tiktoken.go` implements it via `pkoukk/tiktoken-go`. Default encoding `cl100k_base`. `New` / `MustNew` constructors.
+4. [x] `cmd/registry/main.go` wires the tokenizer in `buildService` and exposes the `--tokenizer` flag (env `TOKENIZER`, default `cl100k_base`). Stored on `registryBundle.Tokenizer`.
+5. [x] `tiktoken_test.go` round-trips empty / ASCII / Lithuanian (diacritics) / mixed / newlines / emoji. Token-density spot check: Lithuanian over-segments to ratio 2.66 vs English — well within the 5× upper guard.
 
-**End-of-phase visible result:** registry binary builds, starts, holds a tokenizer instance — no behavior change. `go test ./internal/infra/tokenizer/...` green.
+**End-of-phase outcome:** `go build ./...` + `go vet ./...` clean. `go test ./internal/infra/tokenizer/...` PASS in 0.5s. Tokenizer hangs off the bundle but no caller consumes it yet — chunker still word-based. Ready for Phase 2 chunker rewrite.
 
 ## Phase 2 — Token-sized chunker with neighbor overlap
 
@@ -125,3 +118,4 @@ The plan is done when:
 ## Progress log
 
 - **2026-06-07 23:46** — plan created from [[spec - chunking - token-sized chunks with neighbor overlap and per-collection rechunk]]. On branch `task/eidos-spec-chunking-rechunk`. Awaiting start.
+- **2026-06-07 23:58** — Phase 1 completed. tiktoken-go (pure Go) added; `chunker.Tokenizer` interface + tiktoken adapter shipped; `--tokenizer` flag wired into registry; round-trip tests cover Lithuanian + English + emoji. Lt/En token-density ratio = 2.66, defaults (3600 cl100k_base tokens) still fit a 4k window comfortably for Lithuanian text. No behavior change yet — chunker call sites still word-based. Phase 2 next.

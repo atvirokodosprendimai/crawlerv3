@@ -37,10 +37,12 @@ import (
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/embedclient"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/lease"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/logx"
+	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/pipeline/chunker"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/qdrant"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/quickwit"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/stanza"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/store/local"
+	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/tokenizer/tiktoken"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/urls"
 )
 
@@ -97,6 +99,12 @@ func main() {
 			&cli.StringFlag{Name: "quickwit-api-key", Sources: cli.EnvVars("QUICKWIT_API_KEY")},
 			&cli.StringFlag{Name: "quickwit-index", Value: "extracted", Sources: cli.EnvVars("QUICKWIT_INDEX"),
 				Usage: "default Quickwit index for ingest + search"},
+
+			// Chunker tokenizer — used by the in-process chunker to size
+			// document_chunks in token space. cl100k_base is the standard default;
+			// per-collection overrides will come via the collections table.
+			&cli.StringFlag{Name: "tokenizer", Value: "cl100k_base", Sources: cli.EnvVars("TOKENIZER"),
+				Usage: "default tokenizer for chunker (cl100k_base, p50k_base, r50k_base)"},
 		},
 		Commands: []*cli.Command{
 			{Name: "serve", Usage: "run HTTP API", Flags: []cli.Flag{
@@ -261,6 +269,7 @@ type registryBundle struct {
 	Blobs       *local.Store
 	Extractions *gormrepo.ExtractionRepo
 	Chunks      *gormrepo.ChunkRepo
+	Tokenizer   chunker.Tokenizer // wired in Phase 1; chunker consumes it in Phase 2
 }
 
 func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
@@ -271,6 +280,10 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 	signer, err := lease.New(secret)
 	if err != nil {
 		return nil, err
+	}
+	tok, err := tiktoken.New(cmd.String("tokenizer"))
+	if err != nil {
+		return nil, fmt.Errorf("buildService: tokenizer: %w", err)
 	}
 	blobs, err := local.New(cmd.String("blobs-root"))
 	if err != nil {
@@ -348,6 +361,7 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 		Pipeline: pipe, Dispatcher: disp,
 		Workers: wrepo, Lake: lrepo, Blobs: blobs,
 		Extractions: erepo, Chunks: crepo,
+		Tokenizer: tok,
 	}, nil
 }
 
