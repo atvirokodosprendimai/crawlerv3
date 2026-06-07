@@ -39,10 +39,16 @@ type Pipeline struct {
 // NewPipeline wires a Pipeline. By default html_strip and text_passthrough
 // run internally; pdf_ocr / office_to_pdf / docx_to_pdf are deferred to
 // external task workers.
-func NewPipeline(l lake.Repository, b lake.BlobStore, p processing.Repository, e extraction.Repository, c chunking.Repository) *Pipeline {
+//
+// tok is the chunker tokenizer; it is stamped onto ChunkCfg so chunker.Split
+// has what it needs without per-call wiring. Required — pass it from the
+// registry bundle.
+func NewPipeline(l lake.Repository, b lake.BlobStore, p processing.Repository, e extraction.Repository, c chunking.Repository, tok chunker.Tokenizer) *Pipeline {
+	cfg := chunker.Defaults()
+	cfg.Tok = tok
 	return &Pipeline{
 		Lake: l, Blobs: b, Processing: p, Extractions: e, Chunks: c,
-		ChunkCfg: chunker.Defaults(),
+		ChunkCfg: cfg,
 		InternalProcessors: []processing.Processor{
 			processing.ProcHTMLStrip,
 			processing.ProcTextPassthrough,
@@ -229,7 +235,7 @@ func (p *Pipeline) writeChunks(ctx context.Context, docID int64, text string) er
 			DocumentID: docID,
 			ChunkIndex: c.Index,
 			Text:       c.Text,
-			TokenCount: c.WordCount,
+			TokenCount: c.TokenCount,
 		})
 	}
 	return p.Chunks.InsertMany(ctx, rows)

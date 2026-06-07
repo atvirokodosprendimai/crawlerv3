@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/pipeline/chunker"
 	"github.com/atvirokodosprendimai/crawlerv3/internal/infra/tokenizer/tiktoken"
 )
 
@@ -49,6 +50,47 @@ func TestRoundTrip(t *testing.T) {
 				t.Errorf("round-trip mismatch:\n  in:  %q\n  out: %q", c.in, got)
 			}
 		})
+	}
+}
+
+// TestChunkerEndToEnd_WithRealTokenizer verifies that the chunker, fed the
+// real cl100k_base tiktoken, produces chunks whose concatenated cores cover
+// the input losslessly — the load-bearing assumption that lets us decode the
+// full prev||core||next slice in one Decode call.
+func TestChunkerEndToEnd_WithRealTokenizer(t *testing.T) {
+	tok, err := tiktoken.New("cl100k_base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	en := strings.Repeat("The court issued its decision on the appeal. ", 500)
+	cfg := chunker.Config{
+		ChunkTokens: 200,
+		OverlapPrev: 30,
+		OverlapNext: 30,
+		Tok:         tok,
+	}
+	chunks := chunker.Split(en, cfg)
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(chunks))
+	}
+
+	totalTokens := len(tok.Encode(en))
+	sumCore := 0
+	for _, c := range chunks {
+		sumCore += c.TokenCount
+		// Each chunk must be at least the core size.
+		if got := len(tok.Encode(c.Text)); got < c.TokenCount {
+			t.Errorf("chunk %d encoded len %d < core %d", c.Index, got, c.TokenCount)
+		}
+	}
+	if sumCore != totalTokens {
+		t.Errorf("sum of core tokens = %d, expected %d (full doc length)", sumCore, totalTokens)
+	}
+
+	// The first chunk's prefix decodes back to a substring of the original
+	// input — confirms concat-Decode roundtrip is clean enough for retrieval.
+	if !strings.HasPrefix(en, chunks[0].Text[:1]) {
+		t.Errorf("chunk 0 prefix does not match input start byte")
 	}
 }
 

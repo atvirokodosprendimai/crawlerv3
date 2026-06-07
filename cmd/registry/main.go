@@ -313,14 +313,14 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 		cfg.HeartbeatExtend = d
 	}
 	svc := app.New(cfg, frepo, frepo, lrepo, blobs, wrepo, signer)
-	pipe := app.NewPipeline(lrepo, blobs, prepo, erepo, crepo)
+	pipe := app.NewPipeline(lrepo, blobs, prepo, erepo, crepo, tok)
 	svc.SetPipeline(pipe)
 	disp := app.NewTriggerDispatcher(trepo, prepo)
 	svc.SetDispatcher(disp)
 	resolver := app.NewCollectionResolver(lrepo, frepo, frepo)
 	pipe.SetResolver(resolver)
 	embed := app.NewEmbedSvc(cfg, crepo, signer)
-	tasks := app.NewTaskSvc(cfg, prepo, lrepo, blobs, erepo, signer)
+	tasks := app.NewTaskSvc(cfg, prepo, lrepo, blobs, erepo, signer, tok)
 	tasks.AttachChunkSink(&app.ChunkRepoSink{Repo: crepo})
 	tasks.SetDispatcher(disp)
 	tasks.SetResolver(resolver)

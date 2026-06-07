@@ -50,8 +50,12 @@ type chunkRow struct {
 }
 
 // NewTaskSvc wires a TaskSvc with the necessary ports.
-func NewTaskSvc(cfg Config, p processing.Repository, l lake.Repository, b lake.BlobStore, e extraction.Repository, s *lease.Signer) *TaskSvc {
-	return &TaskSvc{Cfg: cfg, Processing: p, Lake: l, Blobs: b, Extractions: e, Lease: s, ChunkCfg: chunker.Defaults()}
+//
+// tok is the chunker tokenizer; stamped onto ChunkCfg at construction.
+func NewTaskSvc(cfg Config, p processing.Repository, l lake.Repository, b lake.BlobStore, e extraction.Repository, s *lease.Signer, tok chunker.Tokenizer) *TaskSvc {
+	cc := chunker.Defaults()
+	cc.Tok = tok
+	return &TaskSvc{Cfg: cfg, Processing: p, Lake: l, Blobs: b, Extractions: e, Lease: s, ChunkCfg: cc}
 }
 
 // AttachChunkSink installs the chunk persistence adapter (kept separate from
@@ -142,7 +146,7 @@ func (t *TaskSvc) AcceptText(ctx context.Context, in TextResult) error {
 				DocumentID: docID,
 				ChunkIndex: c.Index,
 				Text:       c.Text,
-				TokenCount: c.WordCount,
+				TokenCount: c.TokenCount,
 			})
 		}
 		if err := t.Chunks.InsertMany(ctx, rows); err != nil {

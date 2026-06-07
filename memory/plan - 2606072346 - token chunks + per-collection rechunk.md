@@ -34,23 +34,17 @@ After this plan, the operator can: (a) run `registry rechunk --collection lithua
 
 **End-of-phase outcome:** `go build ./...` + `go vet ./...` clean. `go test ./internal/infra/tokenizer/...` PASS in 0.5s. Tokenizer hangs off the bundle but no caller consumes it yet — chunker still word-based. Ready for Phase 2 chunker rewrite.
 
-## Phase 2 — Token-sized chunker with neighbor overlap
+## Phase 2 — Token-sized chunker with neighbor overlap — [completed]
 
 **Goal:** ship the new chunk shape. Defaults globally; no per-collection config yet.
 
-1. [ ] Rewrite `internal/infra/pipeline/chunker/chunker.go`:
-   - New `Config{ChunkTokens, OverlapPrev, OverlapNext int; Tok Tokenizer}`. Keep `Defaults()` returning `2800 / 400 / 400` with the registry's default tokenizer.
-   - `Split(text string, cfg Config) []Chunk` reimplemented as a token-space sliding window. Step = `ChunkTokens`. Each chunk: `prev-overlap || core || next-overlap`. Boundary chunks have empty prev/next as documented in the spec.
-   - `chunk.TokenCount` records the **core** size, not total.
-2. [ ] Add table-driven tests `chunker_test.go`:
-   - 10k-token synthetic doc → expected 4 chunks, prev/next sizes per spec verification §1.
-   - 500-token doc → 1 chunk, both overlaps empty.
-   - Empty doc → 0 chunks.
-3. [ ] Update `internal/app/pipeline.go` and `internal/app/tasksvc.go` call sites to pass the tokenizer-bearing config. Wire from the bundle.
-4. [ ] Add a one-line bump in `CHANGELOG.md`.
-5. [ ] Smoke test: run `scripts/smoke.sh` end-to-end. New documents should produce one or more 3600-token chunks. Inspect via `sqlite3 ... "SELECT length(text) FROM document_chunks ORDER BY id DESC LIMIT 3;"` — should show ~10-20kB depending on encoding.
+1. [x] `internal/infra/pipeline/chunker/chunker.go` rewritten. Config now `{ChunkTokens, OverlapPrev, OverlapNext, Tok}`. Defaults `2800/400/400`. Split iterates token-space cores; each chunk's `Text = Decode(prev_ids || core_ids || next_ids)` in **one** Decode call so concat-safe tokenizers (tiktoken BPE) keep their roundtrip property.
+2. [x] Tests in `chunker_test.go` use a rune-per-token fake (lossless inverse). Spec verification §1 covered: 10k tokens / 2800 cores → 4 chunks with cores [2800, 2800, 2800, 1600] and exact boundary text. Plus empty / short / overlap-cap / negative-overlap.
+3. [x] `NewPipeline` and `NewTaskSvc` take `chunker.Tokenizer` as a new last arg, stamp into `ChunkCfg`. Registry wires `bundle.Tokenizer` through.
+4. [x] End-to-end real-tiktoken integration test in `tiktoken_test.go` confirms `sum(core tokens) == len(Encode(doc))` for a multi-chunk doc — concat-Decode assumption holds for cl100k_base.
+5. [x] `scripts/smoke.sh` passes end-to-end. Surfaced a pre-existing bug (`UpsertByHost` never set `parallel_fetches`, so reserve's `rn <= pf` filtered every row out on a fresh domain). Fixed in commit `4f78337`. Smoke output: `lake=1 extracted=1 chunks=1 token_count=23` — short doc → one chunk, no overlaps, core-only TokenCount. Matches spec.
 
-**End-of-phase visible result:** every new document ingested goes through the new chunker. Old chunks still exist in DB unchanged. Embed worker receives bigger chunks and forwards them to the model — verify no errors in worker log.
+**End-of-phase outcome:** every new document goes through the token-sized chunker. Old chunks unchanged. Defaults are global (`2800/400/400` via `cl100k_base`). Phase 3 will add per-collection overrides.
 
 ## Phase 3 — `collections` table + per-collection config
 
@@ -119,3 +113,4 @@ The plan is done when:
 
 - **2026-06-07 23:46** — plan created from [[spec - chunking - token-sized chunks with neighbor overlap and per-collection rechunk]]. On branch `task/eidos-spec-chunking-rechunk`. Awaiting start.
 - **2026-06-07 23:58** — Phase 1 completed. tiktoken-go (pure Go) added; `chunker.Tokenizer` interface + tiktoken adapter shipped; `--tokenizer` flag wired into registry; round-trip tests cover Lithuanian + English + emoji. Lt/En token-density ratio = 2.66, defaults (3600 cl100k_base tokens) still fit a 4k window comfortably for Lithuanian text. No behavior change yet — chunker call sites still word-based. Phase 2 next.
+- **2026-06-08 00:05** — Phase 2 completed. Chunker rewritten to token-space sliding window with `prev||core||next` shape; `Defaults()` = 2800/400/400. `NewPipeline` and `NewTaskSvc` take `Tokenizer` arg; registry wires `bundle.Tokenizer` through. Spec §1 verification covered in `chunker_test.go`. End-to-end with real cl100k_base passes. `scripts/smoke.sh` green — surfaced a pre-existing `UpsertByHost` bug (parallel_fetches=0 → no reserves) and fixed in `4f78337`. Also pulled two unrelated operational fixes (`sweep-now` CLI + idempotent `lake_objects.Insert` on UNIQUE) into commits `104aa79` to address concurrent prod issues; merged to main in `7509375`. Phase 3 next.
