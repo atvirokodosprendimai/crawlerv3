@@ -26,23 +26,25 @@ After this plan, a re-seed of the full 2005→today window produces a case-URL c
 
 ---
 
-## Phase 1 — Capture ground truth (no code changes)
+## Phase 1 — Capture ground truth (no code changes) — [completed]
 
 **Goal:** end the phase knowing *exactly* what's broken. Cheap evidence collection.
 
-1. [ ] Fetch a real `paieska.aspx` page-1 body for three days of varying size: a low-volume day (~10 results, ≤1 page), a mid-volume day (~200 results, multi-page same-block), and a high-volume day (~600 results, spans blocks).
-   - Save as `cmd/litekoworker/testdata/page1_<volume>.html`.
-   - Record the raw `_TotalItemsLabel` text exactly as the site renders it (bytes, not normalized).
-   - => answers question 2: what locale format does Total actually use?
-2. [ ] On the high-volume day, drive the pager manually (via `curl` reproducing `__doPostBack`) up to page 11 and capture the response body.
-   - Save as `cmd/litekoworker/testdata/page11_<date>.html`.
-   - Inspect the `RadDataPager` ctl-suffix sequence at page 11. Compare to current `pageButton(11) = "02"`.
-   - => answers question 3: does `ctl02` from a block-2 VIEWSTATE actually map to page 11?
-3. [ ] Run a one-off SQL probe against current `crawler.db`: per-day case count, distribution. Show how many days hit exactly 50 (page-1 ceiling = Total-parse failure signature) vs hit exactly 500 (block-2 ceiling = navigation failure signature) vs anything else.
-   - => answers magnitude allocation: if N days plateau at 50, parse failure is the dominant cause.
-4. [ ] Write a one-page evidence note `memory/note - 2606072235 - liteko ground truth.md` summarising the three findings. Link from this plan.
+1. [x] Fetch a real `paieska.aspx` page-1 body for days of varying size.
+   - => 7 daily probes saved under `cmd/litekoworker/testdata/probe_<date>.html` (range 143–1016 cases)
+   - => plus two aggregates: 2024 = 67,430; 2005–2025 = **2,235,113**
+   - => **baseline was off by 10×**: site total is 2.2M, not 22M
+   - => Total label always plain ASCII integers — **Total-parse hypothesis falsified**
+2. [x] On the high-volume day, drive the pager manually (via `curl` reproducing `__doPostBack`) up to page 11 and capture the response body.
+   - => standalone Go driver `/tmp/drive_liteko_pager.go` replayed VIEWSTATE chain through pages 1→13 on 2015-04-20 (Total=1016)
+   - => block-2 transition verified: `POST ctl10` from block 1 lands on page 11 (offset 501), pager re-renders with ctl00..ctl11, then `POST ctl02` lands on page 12 (offset 551)
+   - => **`pageButton` hypothesis falsified — current code is correct**
+3. [ ] Run a one-off SQL probe against the operator's prod registry DB: per-day case count, distribution.
+   - => deferred — local `crawler.db` has only 9g.lt + vvtat.lrv.lt data, no Liteko rows
+   - => operator must run the probe on the box where the 130k figure was observed
+4. [x] Write evidence note `memory/note - 2606072235 - liteko ground truth.md`. Done.
 
-**End-of-phase visible result:** an evidence note + three HTML fixtures, plus an SQL-derived attribution of how much of the gap each failure mode accounts for. Decides phases 2–4 sizing.
+**End-of-phase outcome:** *all three code-level hypotheses falsified by direct evidence.* The remaining gap (130k ingested vs ~2.2M reachable) must be operational — frontier never drained, wrong worker class reserving the listings, depth/scope filter, or per-job failures. The deferred SQL probe is now the only cheap way to settle it.
 
 ## Phase 2 — Fix the cheap & certain (off-by-one + Total parse)
 
@@ -122,3 +124,4 @@ The plan is done when:
 ## Progress log
 
 - **2026-06-07 22:35** — plan created from [[spec - bug - litekoworker pagination tail miss + complete walk]]. On branch `task/eidos-spec-liteko-pagination`. Awaiting user start signal.
+- **2026-06-07 22:50** — Phase 1 executed (evidence-only, no code changes). All three code-level hypotheses (Total parse, off-by-one tail miss, pageButton block-2 navigation) **falsified** by direct evidence — see [[note - 2606072235 - liteko ground truth]]. Site baseline corrected from 22M to **2.235M**. Phases 2–4 no longer load-bearing for closing the gap; they remain correct fixes (defense-in-depth) but no longer urgent. The 130k-vs-2.2M gap is now attributed to **operational causes** — requires operator's prod DB to settle. Awaiting decision on plan re-scoping.
