@@ -66,6 +66,8 @@ func main() {
 						Usage: "max parallel jobs per reserved batch"},
 					&cli.DurationFlag{Name: "idle-sleep", Value: 5 * time.Second},
 					&cli.DurationFlag{Name: "fetch-timeout", Value: 60 * time.Second},
+					&cli.DurationFlag{Name: "api-timeout", Value: 120 * time.Second,
+						Usage: "registry API client timeout (reserve / result / fail / heartbeat). Raise when concurrency is high and the registry queues result POSTs behind the SQLite writer."},
 					&cli.DurationFlag{Name: "page-delay", Value: 500 * time.Millisecond,
 						Usage: "pause between RadDataPager POSTs within one listing job"},
 					&cli.StringFlag{Name: "user-agent", Value: "crawlerv3-litekoworker/0.1"},
