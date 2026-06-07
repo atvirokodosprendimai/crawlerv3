@@ -173,6 +173,19 @@ func main() {
 					Usage: "max URLs reserved per call from this domain; raise on cooperative hosts to enable concurrent fetches"},
 			}, Action: actionSeedDomain},
 			{Name: "list-domains", Usage: "show seeded crawl targets", Action: actionListDomains},
+
+			// collections (Phase 3) — per-collection chunker sizing.
+			{Name: "list-collections", Usage: "show per-collection chunker config (empty list = every collection uses registry defaults)", Action: actionListCollections},
+			{Name: "set-collection", Usage: "upsert per-collection chunker config; -1 leaves a field unchanged at registry defaults on first insert", Flags: []cli.Flag{
+				&cli.StringFlag{Name: "name", Required: true},
+				&cli.IntFlag{Name: "chunk-tokens", Value: -1, Usage: "-1 = registry default (2800)"},
+				&cli.IntFlag{Name: "overlap-prev", Value: -1, Usage: "-1 = registry default (400)"},
+				&cli.IntFlag{Name: "overlap-next", Value: -1, Usage: "-1 = registry default (400)"},
+				&cli.StringFlag{Name: "tokenizer", Value: "", Usage: "empty = inherit from registry --tokenizer at chunk time"},
+			}, Action: actionSetCollection},
+			{Name: "delete-collection", Usage: "remove a collections row; future ingest reverts to registry defaults", Flags: []cli.Flag{
+				&cli.StringFlag{Name: "name", Required: true},
+			}, Action: actionDeleteCollection},
 			{Name: "activate-domain", Usage: "set is_active=1 for a domain", Flags: []cli.Flag{
 				&cli.StringFlag{Name: "host", Required: true},
 			}, Action: actionActivateDomain(true)},
@@ -272,7 +285,9 @@ type registryBundle struct {
 	Blobs       *local.Store
 	Extractions *gormrepo.ExtractionRepo
 	Chunks      *gormrepo.ChunkRepo
-	Tokenizer   chunker.Tokenizer // wired in Phase 1; chunker consumes it in Phase 2
+	Tokenizer       chunker.Tokenizer         // wired in Phase 1; chunker consumes it in Phase 2
+	Collections     *gormrepo.CollectionConfigRepo
+	CollectionsCfg  *app.CollectionConfigResolver
 }
 
 func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
@@ -319,11 +334,17 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 	svc.SetDispatcher(disp)
 	resolver := app.NewCollectionResolver(lrepo, frepo, frepo)
 	pipe.SetResolver(resolver)
+	ccrepo := gormrepo.NewCollectionConfigRepo(db)
+	defaults := chunker.Defaults()
+	defaults.Tok = tok
+	cfgResolver := app.NewCollectionConfigResolver(ccrepo, defaults)
+	pipe.SetConfigResolver(cfgResolver)
 	embed := app.NewEmbedSvc(cfg, crepo, signer)
 	tasks := app.NewTaskSvc(cfg, prepo, lrepo, blobs, erepo, signer, tok)
 	tasks.AttachChunkSink(&app.ChunkRepoSink{Repo: crepo})
 	tasks.SetDispatcher(disp)
 	tasks.SetResolver(resolver)
+	tasks.SetConfigResolver(cfgResolver)
 
 	// Qdrant + optional query-embed client (slice 10)
 	qcli := qdrant.New(qdrant.Config{
@@ -364,7 +385,9 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 		Pipeline: pipe, Dispatcher: disp,
 		Workers: wrepo, Lake: lrepo, Blobs: blobs,
 		Extractions: erepo, Chunks: crepo,
-		Tokenizer: tok,
+		Tokenizer:      tok,
+		Collections:    ccrepo,
+		CollectionsCfg: cfgResolver,
 	}, nil
 }
 
@@ -865,6 +888,89 @@ func actionSweepNow(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 	fmt.Printf("sweep-now released=%d\n", n)
+	return nil
+}
+
+// --- collections (Phase 3) --------------------------------------------------
+
+func actionListCollections(ctx context.Context, cmd *cli.Command) error {
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	rows, err := gormrepo.NewCollectionConfigRepo(db).List(ctx)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Println("no rows. every collection uses registry defaults (2800 / 400 / 400 / --tokenizer)")
+		return nil
+	}
+	fmt.Printf("%-30s %-8s %-8s %-8s %s\n", "NAME", "CHUNK", "PREV", "NEXT", "TOKENIZER")
+	for _, r := range rows {
+		fmt.Printf("%-30s %-8d %-8d %-8d %s\n",
+			r.Name, r.ChunkTokens, r.OverlapPrev, r.OverlapNext, r.Tokenizer)
+	}
+	return nil
+}
+
+func actionSetCollection(ctx context.Context, cmd *cli.Command) error {
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	repo := gormrepo.NewCollectionConfigRepo(db)
+	name := cmd.String("name")
+
+	// Start from existing row if present so unspecified flags don't clobber.
+	var base chunking.CollectionConfig
+	existing, err := repo.Get(ctx, name)
+	switch {
+	case errors.Is(err, chunking.ErrCollectionNotFound):
+		base = chunking.CollectionConfig{
+			Name:        name,
+			ChunkTokens: 2800,
+			OverlapPrev: 400,
+			OverlapNext: 400,
+			Tokenizer:   "cl100k_base",
+		}
+	case err != nil:
+		return err
+	default:
+		base = *existing
+	}
+	if v := cmd.Int("chunk-tokens"); v >= 0 {
+		base.ChunkTokens = v
+	}
+	if v := cmd.Int("overlap-prev"); v >= 0 {
+		base.OverlapPrev = v
+	}
+	if v := cmd.Int("overlap-next"); v >= 0 {
+		base.OverlapNext = v
+	}
+	if v := cmd.String("tokenizer"); v != "" {
+		base.Tokenizer = v
+	}
+	if err := repo.Upsert(ctx, base); err != nil {
+		return err
+	}
+	fmt.Printf("collection=%s chunk_tokens=%d overlap_prev=%d overlap_next=%d tokenizer=%s\n",
+		base.Name, base.ChunkTokens, base.OverlapPrev, base.OverlapNext, base.Tokenizer)
+	return nil
+}
+
+func actionDeleteCollection(ctx context.Context, cmd *cli.Command) error {
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := gormrepo.NewCollectionConfigRepo(db).Delete(ctx, cmd.String("name")); err != nil {
+		return err
+	}
+	fmt.Printf("collection=%s deleted\n", cmd.String("name"))
 	return nil
 }
 

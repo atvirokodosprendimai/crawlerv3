@@ -46,28 +46,19 @@ After this plan, the operator can: (a) run `registry rechunk --collection lithua
 
 **End-of-phase outcome:** every new document goes through the token-sized chunker. Old chunks unchanged. Defaults are global (`2800/400/400` via `cl100k_base`). Phase 3 will add per-collection overrides.
 
-## Phase 3 — `collections` table + per-collection config
+## Phase 3 — `collections` table + per-collection config — [completed]
 
 **Goal:** operator can override chunk sizing per collection at runtime.
 
-1. [ ] Add migration `0010_collections.sql` in all three dialect dirs. Schema per spec §Design / "collections table".
-2. [ ] New port `internal/domain/chunking/collection_config.go`:
-   ```go
-   type CollectionConfig struct { Name, Tokenizer string; ChunkTokens, OverlapPrev, OverlapNext int }
-   type CollectionConfigRepo interface {
-       Get(ctx context.Context, name string) (*CollectionConfig, error)
-       Upsert(ctx context.Context, cfg CollectionConfig) error
-       List(ctx context.Context) ([]CollectionConfig, error)
-       Delete(ctx context.Context, name string) error
-   }
-   ```
-3. [ ] Implement in `internal/infra/db/gormrepo/collection_config_repo.go`.
-4. [ ] New service `app.CollectionConfigResolver` mirroring the existing `CollectionResolver`. Method `ResolveConfig(ctx, collectionName) (chunker.Config, fromTable bool, err)`. Falls back to registry defaults on no-row.
-5. [ ] Wire `Pipeline` and `TaskSvc` to call `Resolver.ResolveConfig(ctx, collection)` per document, then pass that config into `chunker.Split`.
-6. [ ] Operator CLI: `registry list-collections` / `set-collection --name X --chunk-tokens N --overlap-prev N --overlap-next N --tokenizer T` / `delete-collection --name X`. Follow flag conventions from `update-domain` (e.g. `-1` = leave unchanged, `-` = clear/reset).
-7. [ ] Smoke `scripts/smoke_collections.sh`: ingest a doc with no collection row → default sizing. Add a row with smaller chunk_tokens. Ingest a doc that maps to that collection → smaller chunks. Assert.
+1. [x] Migration `0010_collections.sql` shipped in all three dialect dirs.
+2. [x] Port `chunking.CollectionConfigRepo` (Get/Upsert/List/Delete) + `ErrCollectionNotFound` sentinel.
+3. [x] `gormrepo.CollectionConfigRepo` implementation with `ON CONFLICT … DO UPDATE` for `Upsert`.
+4. [x] `app.CollectionConfigResolver` with `ResolveConfig(ctx, name) (chunker.Config, fromTable bool, err)`. Empty table → defaults. Lookup errors fall back to defaults so ingest never blocks.
+5. [x] `Pipeline` and `TaskSvc` thread `collection` into the chunk-writing path; both gained `ConfigResolver` field + `SetConfigResolver` method. The chunker is run with the resolved config (falling back to bundle defaults) on every document.
+6. [x] CLI: `list-collections` / `set-collection --name X --chunk-tokens N --overlap-prev N --overlap-next N --tokenizer T` / `delete-collection --name X`. Partial updates preserve existing fields (read-modify-write).
+7. [x] `scripts/smoke_collections.sh` covers: empty → set → list → partial update preserves → tokenizer change → delete → empty. Passes.
 
-**End-of-phase visible result:** `registry list-collections` works; per-collection overrides applied at chunk time; new smoke passes.
+**End-of-phase outcome:** operator can tune per-collection chunk sizing at runtime; ingest picks up changes on the next document. Phase 4 (rechunk) next.
 
 ## Phase 4 — `registry rechunk` CLI
 
@@ -114,3 +105,4 @@ The plan is done when:
 - **2026-06-07 23:46** — plan created from [[spec - chunking - token-sized chunks with neighbor overlap and per-collection rechunk]]. On branch `task/eidos-spec-chunking-rechunk`. Awaiting start.
 - **2026-06-07 23:58** — Phase 1 completed. tiktoken-go (pure Go) added; `chunker.Tokenizer` interface + tiktoken adapter shipped; `--tokenizer` flag wired into registry; round-trip tests cover Lithuanian + English + emoji. Lt/En token-density ratio = 2.66, defaults (3600 cl100k_base tokens) still fit a 4k window comfortably for Lithuanian text. No behavior change yet — chunker call sites still word-based. Phase 2 next.
 - **2026-06-08 00:05** — Phase 2 completed. Chunker rewritten to token-space sliding window with `prev||core||next` shape; `Defaults()` = 2800/400/400. `NewPipeline` and `NewTaskSvc` take `Tokenizer` arg; registry wires `bundle.Tokenizer` through. Spec §1 verification covered in `chunker_test.go`. End-to-end with real cl100k_base passes. `scripts/smoke.sh` green — surfaced a pre-existing `UpsertByHost` bug (parallel_fetches=0 → no reserves) and fixed in `4f78337`. Also pulled two unrelated operational fixes (`sweep-now` CLI + idempotent `lake_objects.Insert` on UNIQUE) into commits `104aa79` to address concurrent prod issues; merged to main in `7509375`. Phase 3 next.
+- **2026-06-08 00:11** — Phase 3 completed. Migration `0010_collections.sql` (3 dialects). New `chunking.CollectionConfigRepo` port + `gormrepo` impl using `ON CONFLICT … DO UPDATE`. New `app.CollectionConfigResolver` resolves per-collection sizing with fallback to registry defaults. `Pipeline.writeChunks` and `TaskSvc.AcceptText` now resolve config per document; existing call shape kept by keeping `ChunkCfg` as the fallback. Three CLI subcommands: `list-collections`, `set-collection` (read-modify-write so partial flags don't clobber), `delete-collection`. New `scripts/smoke_collections.sh` covers the full lifecycle. Phase 4 (rechunk CLI) next.

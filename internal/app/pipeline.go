@@ -30,7 +30,8 @@ type Pipeline struct {
 	Processing         processing.Repository
 	Extractions        extraction.Repository
 	Chunks             chunking.Repository
-	ChunkCfg           chunker.Config
+	ChunkCfg           chunker.Config            // registry-wide defaults; used when ConfigResolver returns no row
+	ConfigResolver     *CollectionConfigResolver // optional; per-collection chunk sizing
 	InternalProcessors []processing.Processor
 	Resolver           *CollectionResolver // optional; resolves per-domain embed collection
 	FTS                *FTSSvc             // optional; mirrors extracted text into Quickwit (Stanza-rewritten)
@@ -58,6 +59,10 @@ func NewPipeline(l lake.Repository, b lake.BlobStore, p processing.Repository, e
 
 // SetResolver wires the collection resolver for per-domain embed routing.
 func (p *Pipeline) SetResolver(r *CollectionResolver) { p.Resolver = r }
+
+// SetConfigResolver wires the per-collection chunk-size resolver. When unset,
+// every document uses Pipeline.ChunkCfg.
+func (p *Pipeline) SetConfigResolver(r *CollectionConfigResolver) { p.ConfigResolver = r }
 
 // SetFTS attaches an FTSSvc; when set, the pipeline forwards extracted text
 // (Stanza-rewritten) into Quickwit after every extraction upsert. Failures
@@ -145,7 +150,7 @@ func (p *Pipeline) execHTML(ctx context.Context, job *processing.Job) error {
 	if p.FTS != nil {
 		p.FTS.OnExtracted(ctx, docID, job.LakeObjectID, collection, text)
 	}
-	return p.writeChunks(ctx, docID, text)
+	return p.writeChunks(ctx, docID, text, collection)
 }
 
 // execTextPassthrough treats the raw blob as UTF-8 text and writes it directly
@@ -181,7 +186,7 @@ func (p *Pipeline) execTextPassthrough(ctx context.Context, job *processing.Job)
 	if p.FTS != nil {
 		p.FTS.OnExtracted(ctx, docID, job.LakeObjectID, collection, text)
 	}
-	return p.writeChunks(ctx, docID, text)
+	return p.writeChunks(ctx, docID, text, collection)
 }
 
 // resolveCollection returns the embed-collection hint for a lake object.
@@ -220,11 +225,19 @@ func (p *Pipeline) execPDF(ctx context.Context, job *processing.Job) error {
 	if p.FTS != nil {
 		p.FTS.OnExtracted(ctx, docID, job.LakeObjectID, collection, text)
 	}
-	return p.writeChunks(ctx, docID, text)
+	return p.writeChunks(ctx, docID, text, collection)
 }
 
-func (p *Pipeline) writeChunks(ctx context.Context, docID int64, text string) error {
-	pieces := chunker.Split(text, p.ChunkCfg)
+func (p *Pipeline) writeChunks(ctx context.Context, docID int64, text, collection string) error {
+	cfg := p.ChunkCfg
+	if p.ConfigResolver != nil {
+		resolved, _, err := p.ConfigResolver.ResolveConfig(ctx, collection)
+		if err == nil {
+			resolved.Tok = p.ChunkCfg.Tok // tokenizer always from registry default; row may name a different one in the future
+			cfg = resolved
+		}
+	}
+	pieces := chunker.Split(text, cfg)
 	if len(pieces) == 0 {
 		return nil
 	}
