@@ -23,6 +23,8 @@ Distributed web crawler + data lake. Central Go registry hands jobs to anonymous
    - [`ocrworker`](#ocrworker) — dedicated PDF OCR worker (mutool + gs + tesseract page-parallel)
    - [`embedworker`](#embedworker) — load-balanced embedding worker (Ollama fleet, `/api/embed` batch)
    - [`agent`](#agent) — unified worker (crawl + multiple task kinds)
+   - [`litekoworker`](#litekoworker) — Liteko-specific worker (WebForms POST pagination, no browser)
+   - [`unicrawler`](#unicrawler) — YAML-configured Selenium worker for JS-heavy sites
    - [`migrator`](#migrator) — local↔S3 blob mover
 6. [Configuration (env vars)](#configuration-env-vars)
 7. [HTTP API](#http-api)
@@ -884,6 +886,288 @@ migrator \
 | `--s3-path-style` (`S3_PATH_STYLE`) | `false` | Force path-style addressing. **Required by MinIO**; harmless for AWS. |
 | `--batch` | `100` | Rows scanned per page. Lower for huge blobs (memory); higher for many small ones. |
 | `--delete-src` | `false` | **Destructive.** Removes the source blob after the copy succeeds + verifies. Always do a dry run first (`--delete-src` off), then re-run with it on. |
+
+---
+
+### `litekoworker`
+
+Liteko (`liteko.teismai.lt`) is the Lithuanian public court-rulings archive. Its listings are paginated by an ASP.NET WebForms RadDataPager: page 1 is a normal `GET`, pages 2..N are `__doPostBack` `POST`s that echo `__VIEWSTATE` back. The generic `worker` only knows how to `GET`, so it stops at page 1.
+
+`litekoworker` is a registry-backed worker that knows the WebForms pagination protocol natively — it walks every pager page inline (no real browser needed, no Selenium dependency) and reports every discovered case-detail URL in the result's `discovered_links`. Use it when you want the cheapest possible scrape of this one specific site.
+
+For any other JS-heavy site (or if Liteko ever changes its WebForms surface), use [`unicrawler`](#unicrawler) instead.
+
+```bash
+# 1. Seed the frontier: register the domain + one search URL per day
+#    in the range. Idempotent — re-runs dedup via the URL hash index.
+./bin/litekoworker seed \
+  --db-dsn crawler.db \
+  --from 2005-01-01            # --to defaults to today (UTC)
+
+# 2. Create a worker PAT
+./bin/registry create-worker --label liteko-1 --capabilities crawl
+
+# 3. Drain the frontier (pager walked per listing job)
+./bin/litekoworker run \
+  --registry http://localhost:8080 \
+  --pat $PAT \
+  --concurrency 2 \
+  --page-delay 500ms
+```
+
+| Flag (env) | Default | When to use |
+|---|---|---|
+| `--db-dsn` (`DB_DSN`) | `crawler.db` | `seed` only. Same DB the registry uses. |
+| `--from` | `2005-01-01` | `seed` only. YYYY-MM-DD inclusive start. |
+| `--to` | (today UTC) | `seed` only. YYYY-MM-DD inclusive end. |
+| `--crawl-delay-ms` | `1000` | `seed` only. Applied at domain creation; ignored on re-runs. |
+| `--registry` (`REGISTRY`) | — *(required)* | `run` only. Registry base URL. |
+| `--pat` (`PAT`) | — *(required)* | `run` only. Worker PAT with `crawl` capability. |
+| `--batch` | `4` | `run` only. Jobs reserved per `/v1/jobs/reserve` call. |
+| `--concurrency` | `2` | `run` only. Parallel job goroutines. |
+| `--idle-sleep` | `5s` | `run` only. Backoff when reserve returns empty. |
+| `--fetch-timeout` | `60s` | `run` only. Per-request timeout (covers each pager page). |
+| `--page-delay` | `500ms` | `run` only. Pause between `__doPostBack` POSTs within one listing job. |
+| `--user-agent` | `crawlerv3-litekoworker/0.1` | UA on both GET and POST. |
+
+Detail pages (`tekstas.aspx?id=<uuid>`) are plain `GET`s; the worker uploads them as-is to the lake. Structured-field extraction (decision text, participants table, category labels) is **not** done by `litekoworker` — that belongs in a downstream task processor, or use [`unicrawler`](#unicrawler) which does it declaratively.
+
+---
+
+### `unicrawler`
+
+`unicrawler` is the universal, YAML-configured, **Selenium-driven** crawl worker. Use it for any site where:
+
+- Listings are rendered by JavaScript (SPA, infinite scroll, ASP.NET WebForms).
+- You want the pagination + field-extraction rules to live in version-controlled config, not Go code.
+- You don't want to write a per-site Go worker every time.
+
+It takes one YAML config per site. It connects to a Selenium WebDriver endpoint (typically `selenium/standalone-chrome` in Docker), reserves jobs from the registry, drives a real Chromium per job, walks the pager according to YAML, extracts links + structured fields, and posts:
+
+- **Page-1 HTML** → registry lake (`/v1/jobs/result`, content-type `text/html`).
+- **All discovered URLs from every pager page** → `discovered_links` on the same result. The registry's frontier scope-filter dedups + drops external hosts as usual.
+- **Structured fields** → JSON sidecar `<sidecar-dir>/<sha256(url)>.json`. Promotion to the lake / FTS pipeline is left as a follow-up — for now the sidecar dir is the canonical home for extracted fields.
+
+#### Subcommands
+
+```bash
+# Parse + lint a config without touching DB or browser.
+./bin/unicrawler validate configs/liteko.yaml
+
+# Open the registry DB and enqueue the site's seed URLs.
+#   - seed.type=urls       → enqueue the literal list.
+#   - seed.type=date_range → substitute {day} in url_template for every
+#     day in [from, to]. --to override lets ops freeze the upper bound
+#     without editing the config.
+./bin/unicrawler seed \
+  --db-dsn crawler.db \
+  --to 2025-12-31 \
+  configs/liteko.yaml
+
+# Run the worker loop. Needs a reachable Selenium WebDriver.
+./bin/unicrawler run \
+  --registry http://localhost:8080 \
+  --pat $PAT \
+  --webdriver http://localhost:4444/wd/hub \
+  --concurrency 2 \
+  --sidecar-dir ./sidecars \
+  configs/liteko.yaml
+```
+
+#### Selenium setup (Docker)
+
+```bash
+# Standalone Chrome, port 4444 for WebDriver, port 7900 for noVNC debugging.
+docker run -d --name sel \
+  -p 4444:4444 \
+  -p 7900:7900 \
+  --shm-size=2g \
+  selenium/standalone-chrome:latest
+
+# Sanity check: should print the Selenium status page.
+curl -s http://localhost:4444/wd/hub/status | head -c 200
+```
+
+`unicrawler run` opens `--concurrency` sessions at startup and recycles them across jobs (faster than per-job session creation, but state — cookies, `sessionStorage` — leaks between jobs).
+
+#### `run` flags
+
+| Flag (env) | Default | When to use |
+|---|---|---|
+| `--registry` (`REGISTRY`) | — *(required)* | Registry base URL. |
+| `--pat` (`PAT`) | — *(required)* | Worker PAT with `crawl` capability. |
+| `--webdriver` (`WEBDRIVER_URL`) | `http://localhost:4444/wd/hub` | Selenium WebDriver remote URL. Point at your container. |
+| `--browser` (`BROWSER`) | `chrome` | Anything Selenium understands (`firefox`, `edge`, …). Headless flags are auto-applied for `chrome*`. |
+| `--batch` | `2` | Jobs reserved per `/v1/jobs/reserve` call. Browser-driven jobs are slow; keep small. |
+| `--concurrency` | `1` | Parallel browser sessions; each consumes one slot on your Selenium grid. |
+| `--idle-sleep` | `5s` | Backoff when reserve returns empty. |
+| `--page-load-timeout` | `60s` | Selenium `pageLoad` timeout, applied per session. |
+| `--script-timeout` | `30s` | Selenium async-script timeout. |
+| `--sidecar-dir` | `./sidecars` | Output dir for `<sha256(url)>.json` field dumps. Created if missing. |
+
+#### YAML schema
+
+A config has four top-level sections: site metadata, the `seed` spec, and an ordered list of `page_types`. The first `page_type` whose `match` regex fires on a URL owns that URL; non-matching URLs are fetched as plain detail pages (no pagination, no field extraction).
+
+```yaml
+name: liteko                     # human label (used in logs + sidecar paths)
+domain: liteko.teismai.lt        # upserted into the registry domains table
+scheme: https
+crawl_delay_ms: 1500             # applied only at domain creation
+
+seed:
+  type: date_range               # urls | date_range
+  url_template: "https://liteko.teismai.lt/viesasprendimupaieska/paieska.aspx?nuo={day}%2000:00:00&iki={day}%2023:59:59"
+  from: "2005-01-01"
+  to: "today"                    # YYYY-MM-DD or literal "today"
+
+page_types:
+  - name: listing
+    match: 'paieska\.aspx'       # Go regex
+    pagination:
+      type: numbered_buttons
+      total_selector: { selector: "span[id$='_TotalItemsLabel']" }
+      per_page: 50
+      button_template: { selector: "a[id$='_RadDataPager1_ctl00_ctl{NN}']" }
+      button_index_fn: liteko    # liteko | linear
+      delay_ms: 800
+    extract:
+      links:
+        - selector_type: xpath
+          selector: "//td[.//b[normalize-space(text())='Bylos numeris:']]//a"
+          anchor_attr: text
+          new_depth: 1
+      fields: []
+
+  - name: detail
+    match: 'tekstas\.aspx'
+    pagination: { type: none }
+    extract:
+      fields:
+        - name: tekstas
+          selector: "#ctl00_ContentPlaceHolder1_txthtml"
+          mode: text
+        - name: kategorijos
+          selector: "td span[id^='ctl00_ContentPlaceHolder1_kategorijuList_ctrl']"
+          mode: text_list
+        - name: salys
+          selector_type: xpath
+          selector: "//th[normalize-space(text())='Byloje kaip']/ancestor::table[1]//tbody/tr"
+          mode: rows
+          columns:
+            - { name: pavadinimas, index: 0 }
+            - { name: kodas,       index: 1 }
+            - { name: bylojeKaip,  index: 2 }
+```
+
+#### `seed` shapes
+
+| Field | `urls` | `date_range` |
+|---|---|---|
+| `type` | `urls` | `date_range` |
+| `urls` | required (list of strings) | — |
+| `url_template` | — | required; must contain `{day}` |
+| `from` | — | required; `YYYY-MM-DD` |
+| `to` | — | optional; empty or `today` = today UTC |
+
+For `date_range`, one URL is generated per day in the inclusive `[from, to]` range. **Per-day windows are mandatory for sites that cap result counts** (Liteko silently drops the tail past page 100); slicing by day keeps every listing reachable. `--to` on the CLI overrides the YAML value so ops can freeze the upper bound without editing the file.
+
+#### Pagination strategies
+
+Every strategy uses the same `delay_ms` (post-action pause) and `max_pages` (0 = unbounded) controls; each adds its own selectors.
+
+| `type` | Required fields | How it works |
+|---|---|---|
+| `none` | — | Single GET, no pagination. Use for detail pages. |
+| `next_button` | `next_selector` | Find the next-page link/button; if missing or `disabled` / `aria-disabled` / `class*=disabled`, stop. Otherwise click + wait + extract + repeat. |
+| `numbered_buttons` | `total_selector`, `per_page`, `button_template` | Read total result count, compute `extra_pages = total / per_page`, then iterate clicking the button matched by `button_template` with `{NN}` replaced per `button_index_fn`. `liteko` matches scrape.ts's `01..10` then `02..11` repeat. `linear` emits `%02d` of `i`. |
+| `infinite_scroll` | `item_selector` | Scroll to bottom; pause; count `item_selector` matches; if count unchanged for `max_idle_rounds` (default 2), stop. |
+| `url_param` | `url_param` | Re-`Get` the same URL with `?<url_param>=<n>` for `n = start_index, start_index+step, …`. Defaults: `start_index=2`, `step=1`. |
+
+#### Extraction
+
+```yaml
+extract:
+  links:
+    - selector: "a.case-link"      # CSS by default
+      selector_type: css            # or xpath
+      anchor_attr: text             # text (default) | any HTML attribute name
+      new_depth: 1                  # depth assigned to discovered_links rows
+  fields:
+    - name: title
+      selector: "h1.headline"
+      mode: text                    # see below
+```
+
+Field modes:
+
+| `mode` | Output type | Notes |
+|---|---|---|
+| `text` (default) | `string` | First match's `.innerText`, trimmed. |
+| `text_list` | `[]string` | All matches' `.innerText`. |
+| `html` | `string` | First match's `outerHTML` (via `getAttribute("outerHTML")`). |
+| `attribute` | `string` | First match's named attribute; requires `attr: <name>`. |
+| `rows` | `[]map[string]string` | For each matched element, read its child `<td>`s; map TDs at `columns[*].index` to `columns[*].name`. Used for participants tables, key/value tables, etc. |
+
+During pagination, fields are merged across pages:
+- Scalar (`text`, `html`, `attribute`) — first non-empty wins; later pages don't overwrite.
+- List (`text_list`, `rows`) — concatenated.
+
+#### Selectors
+
+Two selector types are supported: **CSS** (W3C, default) and **XPath** (explicit `selector_type: xpath`). XPath is the escape hatch for things CSS can't express portably:
+
+- `//td[.//b[normalize-space(text())='Bylos numeris:']]//a` — "the link inside the TD that contains this specific bold label". CSS `:has()` / `:contains()` aren't W3C-portable across browsers.
+- `//th[normalize-space(text())='Byloje kaip']/ancestor::table[1]//tbody/tr` — "rows of the table whose header cell has this exact text".
+
+The Liteko config uses XPath for both cases above; pure CSS works for most other sites.
+
+At `LinkSpec` / `FieldSpec` level, the YAML keys are flat: `selector: "..."` and `selector_type: xpath` sit at the top of the entry. Inside `Pagination` (where multiple selectors are siblings — `total_selector`, `next_selector`, etc.), each selector is a nested map: `total_selector: { selector: "...", selector_type: xpath }`.
+
+#### End-to-end (Liteko)
+
+```bash
+# 1. Spin Selenium.
+docker run -d --name sel -p 4444:4444 --shm-size=2g \
+  selenium/standalone-chrome:latest
+
+# 2. Seed the frontier from YAML (registers liteko.teismai.lt domain +
+#    ~7700 per-day search URLs from 2005-01-01 to today).
+./bin/unicrawler seed --db-dsn crawler.db configs/liteko.yaml
+
+# 3. Create a worker PAT.
+./bin/registry create-worker --label uni-1 --capabilities crawl
+
+# 4. Run the worker.
+./bin/unicrawler run \
+  --registry http://localhost:8080 \
+  --pat $PAT \
+  --webdriver http://localhost:4444/wd/hub \
+  --concurrency 2 \
+  --sidecar-dir ./sidecars \
+  configs/liteko.yaml
+
+# 5. Inspect a sidecar.
+ls ./sidecars/*.json | head
+cat ./sidecars/<sha>.json | jq '.fields | keys'
+# → ["kategorijos", "salys", "tekstas"]
+```
+
+#### Adapting to a new site
+
+1. Write `configs/<site>.yaml` with the site's domain + seed shape + page-type matchers.
+2. `./bin/unicrawler validate configs/<site>.yaml` — catches schema errors before you touch DB or browser.
+3. `./bin/unicrawler seed --db-dsn crawler.db configs/<site>.yaml` — registers the domain + enqueues seeds.
+4. `./bin/unicrawler run --registry … --pat … configs/<site>.yaml` — drains the frontier.
+
+You don't add Go code per site. If a new pagination *style* shows up (e.g. a `Load more` button that calls an XHR rather than re-rendering the DOM), extend `cmd/unicrawler/paginate.go` once with a new `type:`, then express the rest in YAML.
+
+#### Known limits (v1)
+
+- **No HTTP status capture.** Selenium hides response codes; `result.http_status` is always reported as `200` if the page navigated. 4xx/5xx pages are stored as lake objects with HTTP-200 metadata.
+- **Sessions are reused across jobs.** Cookies and `sessionStorage` leak job-to-job. Fine for unauthenticated public sites (Liteko); breaks any flow that needs a clean session per URL.
+- **Fields land in the sidecar dir, not the lake.** Promotion to a `processing_jobs` pipeline (so fields become searchable in Quickwit / Qdrant) is a follow-up; for now the sidecars are the system of record.
+- **No login / form-fill flows.** Add a YAML pre-step (`pre: [{action: type, selector, value}]`) when the first site that needs it lands.
 
 ---
 

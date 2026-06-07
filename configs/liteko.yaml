@@ -1,0 +1,77 @@
+# Liteko (liteko.teismai.lt) — Lithuanian court rulings public archive.
+#
+# Listings are rendered by ASP.NET WebForms with a Telerik RadDataPager:
+# page 1 is a normal GET, pages 2..N are __doPostBack POSTs that echo
+# VIEWSTATE back. We don't have to model VIEWSTATE here — a real browser
+# clicks the page button and the framework handles it.
+#
+# Detail pages live at tekstas.aspx?id=<uuid> and carry the decision text,
+# the case participants table, and category labels.
+
+name: liteko
+domain: liteko.teismai.lt
+scheme: https
+crawl_delay_ms: 1500
+
+seed:
+  type: date_range
+  # One search URL per calendar day. Per-day ranges are required: a multi-year
+  # search silently drops the tail past Liteko's result cap.
+  url_template: "https://liteko.teismai.lt/viesasprendimupaieska/paieska.aspx?nuo={day}%2000:00:00&iki={day}%2023:59:59"
+  from: "2005-01-01"
+  to: "today"
+
+page_types:
+  # ----------------------------------------------------------------------
+  # Listing: paieska.aspx search-result page. The pager renders 50 cases
+  # at a time; we click numbered ctl00..ctl11 buttons to walk the rest.
+  # ----------------------------------------------------------------------
+  - name: listing
+    match: 'paieska\.aspx'
+    pagination:
+      type: numbered_buttons
+      total_selector:
+        selector: "span[id$='_TotalItemsLabel']"
+      per_page: 50
+      # The Telerik pager renders buttons whose id suffix is ctl00$ctlNN.
+      # ButtonIndexFn=liteko picks NN per scrape.ts's pattern (01..10 then
+      # 02..11 repeat per block).
+      button_template:
+        selector: "a[id$='_RadDataPager1_ctl00_ctl{NN}']"
+      button_index_fn: liteko
+      delay_ms: 800
+    extract:
+      links:
+        # Each case row TD wraps an <a> whose href is the detail URL.
+        # The TD also contains <b>Bylos numeris:</b><span>...</span> — using
+        # XPath because CSS :has() / :contains() isn't W3C-portable.
+        - selector_type: xpath
+          selector: "//td[.//b[normalize-space(text())='Bylos numeris:']]//a"
+          anchor_attr: text
+          new_depth: 1
+      fields: []
+
+  # ----------------------------------------------------------------------
+  # Detail: tekstas.aspx?id=<uuid> — the decision page. No pagination;
+  # we pull the decision text, category labels, and participants table.
+  # ----------------------------------------------------------------------
+  - name: detail
+    match: 'tekstas\.aspx'
+    pagination:
+      type: none
+    extract:
+      fields:
+        - name: tekstas
+          selector: "#ctl00_ContentPlaceHolder1_txthtml"
+          mode: text
+        - name: kategorijos
+          selector: "td span[id^='ctl00_ContentPlaceHolder1_kategorijuList_ctrl']"
+          mode: text_list
+        - name: salys
+          selector_type: xpath
+          selector: "//th[normalize-space(text())='Byloje kaip']/ancestor::table[1]//tbody/tr"
+          mode: rows
+          columns:
+            - {name: pavadinimas, index: 0}
+            - {name: kodas, index: 1}
+            - {name: bylojeKaip, index: 2}
