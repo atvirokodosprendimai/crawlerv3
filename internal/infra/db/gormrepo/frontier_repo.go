@@ -235,6 +235,47 @@ func (r *FrontierRepo) Enqueue(ctx context.Context, j frontier.Job) (bool, error
 	return res.RowsAffected == 1, nil
 }
 
+// EnqueueMany inserts up to len(jobs) frontier rows in a single WriteTX,
+// skipping duplicates keyed by url_hash. Holding the SQLite writer lock once
+// per batch avoids the SQLITE_BUSY_SNAPSHOT (517) contention that loses URLs
+// when callers loop one-Enqueue-per-URL under concurrent result POSTs.
+func (r *FrontierRepo) EnqueueMany(ctx context.Context, jobs []frontier.Job) (int64, error) {
+	if len(jobs) == 0 {
+		return 0, nil
+	}
+	now := time.Now().UTC()
+	var inserted int64
+	err := r.DB.WriteTX(ctx, func(tx *rwdb.Tx) error {
+		for _, j := range jobs {
+			m := Frontier{
+				URLHash:       j.URLHash,
+				URL:           j.URL,
+				CanonicalURL:  j.CanonicalURL,
+				DomainID:      j.DomainID,
+				Depth:         j.Depth,
+				Priority:      j.Priority,
+				Status:        string(frontier.StatusQueued),
+				MaxAttempts:   j.MaxAttempts,
+				ScheduledFor:  now,
+				DiscoveredAt:  now,
+				ParentURLHash: j.ParentURLHash,
+			}
+			if m.MaxAttempts == 0 {
+				m.MaxAttempts = 5
+			}
+			res := tx.Where("url_hash = ?", j.URLHash).Attrs(m).FirstOrCreate(&Frontier{})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 1 {
+				inserted++
+			}
+		}
+		return nil
+	})
+	return inserted, err
+}
+
 // LookupCanonical returns whether a row with this url_hash exists.
 func (r *FrontierRepo) LookupCanonical(ctx context.Context, urlHash []byte) (bool, error) {
 	var n int64

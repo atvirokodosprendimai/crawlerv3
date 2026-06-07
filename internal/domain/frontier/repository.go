@@ -10,6 +10,12 @@ type Repository interface {
 	// Enqueue inserts a URL if its hash is not present. Returns true if inserted.
 	Enqueue(ctx context.Context, j Job) (inserted bool, err error)
 
+	// EnqueueMany inserts a batch of URLs in a single transaction. Returns the
+	// count actually inserted (duplicates by url_hash are silently skipped) and
+	// the first error if any. Used for discovered_links intake where holding
+	// the write lock once is far cheaper than N implicit transactions.
+	EnqueueMany(ctx context.Context, jobs []Job) (inserted int64, err error)
+
 	// Reserve leases up to batch jobs for the given worker. Respects per-domain
 	// crawl_delay_ms and skips dead/leased rows. The capabilities slice gates
 	// per-domain required_capability filtering: empty = match any, otherwise

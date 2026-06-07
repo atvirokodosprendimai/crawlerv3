@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/url"
 	"path"
 	"strings"
@@ -152,8 +153,14 @@ func (s *Service) AcceptResult(ctx context.Context, in ResultIngest) (lakeID int
 		})
 	}
 
-	// Enqueue discovered links. Best-effort: log errors but do not fail the result.
-	_ = s.enqueueDiscovered(ctx, urlHash, in.DiscoveredLinks)
+	// Enqueue discovered links. The listing row is already marked done — we do
+	// not fail the result if a few links can't be saved, but we no longer drop
+	// the error on the floor: it goes to the request log so a regression in the
+	// enqueue path stops being silent.
+	if n, err := s.enqueueDiscovered(ctx, urlHash, in.DiscoveredLinks); err != nil {
+		slog.WarnContext(ctx, "discovered_links partial",
+			"err", err, "received", len(in.DiscoveredLinks), "inserted", n)
+	}
 	return id, nil
 }
 
@@ -173,7 +180,9 @@ func (s *Service) SweepExpiredLeases(ctx context.Context) (int64, error) {
 	return s.Frontier.SweepExpired(ctx, time.Now().UTC())
 }
 
-// enqueueDiscovered canonicalizes hrefs and writes them to the frontier.
+// enqueueDiscovered canonicalizes hrefs and writes them to the frontier in a
+// single batch. Returns the count actually inserted (duplicates by url_hash
+// are silently skipped) and the first persistence error.
 //
 // Default scope rules:
 //   - Drop links whose host is not in the domains table (Cfg.AllowAutoDomains=false).
@@ -182,7 +191,13 @@ func (s *Service) SweepExpiredLeases(ctx context.Context) (int64, error) {
 //
 // Set Cfg.AllowAutoDomains=true to fall back to the legacy "auto-add any host
 // the crawler discovers" behavior (rarely desired in production).
-func (s *Service) enqueueDiscovered(ctx context.Context, parentHash []byte, links []frontier.DiscoveredLink) error {
+//
+// Batching: every accepted link becomes one Job; the whole slice is handed to
+// frontier.EnqueueMany so the SQLite writer lock is acquired once. The earlier
+// per-URL loop racked up N implicit transactions and lost rows to
+// SQLITE_BUSY_SNAPSHOT (517) under concurrent result POSTs.
+func (s *Service) enqueueDiscovered(ctx context.Context, parentHash []byte, links []frontier.DiscoveredLink) (int64, error) {
+	jobs := make([]frontier.Job, 0, len(links))
 	for _, l := range links {
 		if s.Cfg.MaxDepth > 0 && l.NewDepth > s.Cfg.MaxDepth {
 			continue
@@ -212,9 +227,8 @@ func (s *Service) enqueueDiscovered(ctx context.Context, parentHash []byte, link
 		if !dom.IsActive {
 			continue
 		}
-		hash := urls.Hash(canon)
-		_, _ = s.Frontier.Enqueue(ctx, frontier.Job{
-			URLHash:       hash,
+		jobs = append(jobs, frontier.Job{
+			URLHash:       urls.Hash(canon),
 			URL:           l.URL,
 			CanonicalURL:  canon,
 			DomainID:      dom.ID,
@@ -224,7 +238,7 @@ func (s *Service) enqueueDiscovered(ctx context.Context, parentHash []byte, link
 			ParentURLHash: parentHash,
 		})
 	}
-	return nil
+	return s.Frontier.EnqueueMany(ctx, jobs)
 }
 
 // storageKey lays out blobs as: <hashPrefix>/<urlHash>.<ext>
