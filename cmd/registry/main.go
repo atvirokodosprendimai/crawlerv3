@@ -173,6 +173,25 @@ func main() {
 					Usage: "max URLs reserved per call from this domain; raise on cooperative hosts to enable concurrent fetches"},
 			}, Action: actionSeedDomain},
 			{Name: "list-domains", Usage: "show seeded crawl targets", Action: actionListDomains},
+
+			// collections (Phase 3) — per-collection chunker sizing.
+			{Name: "list-collections", Usage: "show per-collection chunker config (empty list = every collection uses registry defaults)", Action: actionListCollections},
+			{Name: "set-collection", Usage: "upsert per-collection chunker config; -1 leaves a field unchanged at registry defaults on first insert", Flags: []cli.Flag{
+				&cli.StringFlag{Name: "name", Required: true},
+				&cli.IntFlag{Name: "chunk-tokens", Value: -1, Usage: "-1 = registry default (2800)"},
+				&cli.IntFlag{Name: "overlap-prev", Value: -1, Usage: "-1 = registry default (400)"},
+				&cli.IntFlag{Name: "overlap-next", Value: -1, Usage: "-1 = registry default (400)"},
+				&cli.StringFlag{Name: "tokenizer", Value: "", Usage: "empty = inherit from registry --tokenizer at chunk time"},
+			}, Action: actionSetCollection},
+			{Name: "delete-collection", Usage: "remove a collections row; future ingest reverts to registry defaults", Flags: []cli.Flag{
+				&cli.StringFlag{Name: "name", Required: true},
+			}, Action: actionDeleteCollection},
+			{Name: "rechunk", Usage: "drop + respit every document_chunks row for a collection using its current sizing config. Use '-' for the default-collection bucket. Qdrant cleanup deferred to Phase 5.", Flags: []cli.Flag{
+				&cli.StringFlag{Name: "collection", Required: true, Usage: "collection name to rebuild; '-' targets documents with empty collection"},
+				&cli.BoolFlag{Name: "dry-run", Usage: "report planned new chunk counts only, no writes"},
+				&cli.IntFlag{Name: "since-doc-id", Value: 0, Usage: "skip documents whose id <= N (incremental runs)"},
+				&cli.IntFlag{Name: "limit", Value: 0, Usage: "cap the number of documents processed (0 = no cap)"},
+			}, Action: actionRechunk},
 			{Name: "activate-domain", Usage: "set is_active=1 for a domain", Flags: []cli.Flag{
 				&cli.StringFlag{Name: "host", Required: true},
 			}, Action: actionActivateDomain(true)},
@@ -272,7 +291,10 @@ type registryBundle struct {
 	Blobs       *local.Store
 	Extractions *gormrepo.ExtractionRepo
 	Chunks      *gormrepo.ChunkRepo
-	Tokenizer   chunker.Tokenizer // wired in Phase 1; chunker consumes it in Phase 2
+	Tokenizer       chunker.Tokenizer         // wired in Phase 1; chunker consumes it in Phase 2
+	Collections     *gormrepo.CollectionConfigRepo
+	CollectionsCfg  *app.CollectionConfigResolver
+	Rechunk         *app.RechunkSvc
 }
 
 func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
@@ -313,17 +335,23 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 		cfg.HeartbeatExtend = d
 	}
 	svc := app.New(cfg, frepo, frepo, lrepo, blobs, wrepo, signer)
-	pipe := app.NewPipeline(lrepo, blobs, prepo, erepo, crepo)
+	pipe := app.NewPipeline(lrepo, blobs, prepo, erepo, crepo, tok)
 	svc.SetPipeline(pipe)
 	disp := app.NewTriggerDispatcher(trepo, prepo)
 	svc.SetDispatcher(disp)
 	resolver := app.NewCollectionResolver(lrepo, frepo, frepo)
 	pipe.SetResolver(resolver)
+	ccrepo := gormrepo.NewCollectionConfigRepo(db)
+	defaults := chunker.Defaults()
+	defaults.Tok = tok
+	cfgResolver := app.NewCollectionConfigResolver(ccrepo, defaults)
+	pipe.SetConfigResolver(cfgResolver)
 	embed := app.NewEmbedSvc(cfg, crepo, signer)
-	tasks := app.NewTaskSvc(cfg, prepo, lrepo, blobs, erepo, signer)
+	tasks := app.NewTaskSvc(cfg, prepo, lrepo, blobs, erepo, signer, tok)
 	tasks.AttachChunkSink(&app.ChunkRepoSink{Repo: crepo})
 	tasks.SetDispatcher(disp)
 	tasks.SetResolver(resolver)
+	tasks.SetConfigResolver(cfgResolver)
 
 	// Qdrant + optional query-embed client (slice 10)
 	qcli := qdrant.New(qdrant.Config{
@@ -333,6 +361,10 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 		Distance: cmd.String("qdrant-distance"),
 	})
 	embed.SetQdrant(qcli)
+	rechunk := app.NewRechunkSvc(erepo, crepo, cfgResolver, defaults)
+	if qcli.Enabled() {
+		rechunk.SetQdrant(qcli)
+	}
 	ecli := embedclient.New(embedclient.Config{
 		BaseURL: cmd.String("embed-url"),
 		Model:   cmd.String("embed-model"),
@@ -364,7 +396,10 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 		Pipeline: pipe, Dispatcher: disp,
 		Workers: wrepo, Lake: lrepo, Blobs: blobs,
 		Extractions: erepo, Chunks: crepo,
-		Tokenizer: tok,
+		Tokenizer:      tok,
+		Collections:    ccrepo,
+		CollectionsCfg: cfgResolver,
+		Rechunk:        rechunk,
 	}, nil
 }
 
@@ -865,6 +900,134 @@ func actionSweepNow(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 	fmt.Printf("sweep-now released=%d\n", n)
+	return nil
+}
+
+// --- collections (Phase 3) --------------------------------------------------
+
+func actionListCollections(ctx context.Context, cmd *cli.Command) error {
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	rows, err := gormrepo.NewCollectionConfigRepo(db).List(ctx)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Println("no rows. every collection uses registry defaults (2800 / 400 / 400 / --tokenizer)")
+		return nil
+	}
+	fmt.Printf("%-30s %-8s %-8s %-8s %s\n", "NAME", "CHUNK", "PREV", "NEXT", "TOKENIZER")
+	for _, r := range rows {
+		fmt.Printf("%-30s %-8d %-8d %-8d %s\n",
+			r.Name, r.ChunkTokens, r.OverlapPrev, r.OverlapNext, r.Tokenizer)
+	}
+	return nil
+}
+
+func actionSetCollection(ctx context.Context, cmd *cli.Command) error {
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	repo := gormrepo.NewCollectionConfigRepo(db)
+	name := cmd.String("name")
+
+	// Start from existing row if present so unspecified flags don't clobber.
+	var base chunking.CollectionConfig
+	existing, err := repo.Get(ctx, name)
+	switch {
+	case errors.Is(err, chunking.ErrCollectionNotFound):
+		base = chunking.CollectionConfig{
+			Name:        name,
+			ChunkTokens: 2800,
+			OverlapPrev: 400,
+			OverlapNext: 400,
+			Tokenizer:   "cl100k_base",
+		}
+	case err != nil:
+		return err
+	default:
+		base = *existing
+	}
+	if v := cmd.Int("chunk-tokens"); v >= 0 {
+		base.ChunkTokens = v
+	}
+	if v := cmd.Int("overlap-prev"); v >= 0 {
+		base.OverlapPrev = v
+	}
+	if v := cmd.Int("overlap-next"); v >= 0 {
+		base.OverlapNext = v
+	}
+	if v := cmd.String("tokenizer"); v != "" {
+		base.Tokenizer = v
+	}
+	if err := repo.Upsert(ctx, base); err != nil {
+		return err
+	}
+	fmt.Printf("collection=%s chunk_tokens=%d overlap_prev=%d overlap_next=%d tokenizer=%s\n",
+		base.Name, base.ChunkTokens, base.OverlapPrev, base.OverlapNext, base.Tokenizer)
+	return nil
+}
+
+func actionDeleteCollection(ctx context.Context, cmd *cli.Command) error {
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := gormrepo.NewCollectionConfigRepo(db).Delete(ctx, cmd.String("name")); err != nil {
+		return err
+	}
+	fmt.Printf("collection=%s deleted\n", cmd.String("name"))
+	return nil
+}
+
+func actionRechunk(ctx context.Context, cmd *cli.Command) error {
+	db, err := openDB(cmd)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	b, err := buildService(cmd, db)
+	if err != nil {
+		return err
+	}
+	rep, err := b.Rechunk.Rechunk(ctx, cmd.String("collection"), app.RechunkOpts{
+		SinceDocID: int64(cmd.Int("since-doc-id")),
+		Limit:      cmd.Int("limit"),
+		DryRun:     cmd.Bool("dry-run"),
+	})
+	if err != nil {
+		return err
+	}
+	for _, d := range rep.Documents {
+		if d.Err != nil {
+			fmt.Printf("doc_id=%d ERROR: %v\n", d.DocumentID, d.Err)
+			continue
+		}
+		line := fmt.Sprintf("doc_id=%d chunks_old=%d chunks_new=%d qdrant_deleted=%d",
+			d.DocumentID, d.OldCount, d.NewCount, d.QdrantDeleted)
+		if d.QdrantErr != nil {
+			line += fmt.Sprintf(" qdrant_err=%q", d.QdrantErr.Error())
+		}
+		fmt.Println(line)
+	}
+	mode := "applied"
+	if rep.DryRun {
+		mode = "dry_run"
+	}
+	source := "defaults"
+	if rep.FromTable {
+		source = "collections-row"
+	}
+	fmt.Printf("rechunk collection=%s mode=%s docs=%d chunks_old=%d chunks_new=%d qdrant_deleted=%d qdrant_errors=%d errors=%d config_source=%s chunk_tokens=%d overlap_prev=%d overlap_next=%d\n",
+		rep.Collection, mode, len(rep.Documents),
+		rep.TotalOld, rep.TotalNew, rep.TotalQdrant, rep.QdrantErrors, rep.Errors,
+		source, rep.Config.ChunkTokens, rep.Config.OverlapPrev, rep.Config.OverlapNext)
 	return nil
 }
 

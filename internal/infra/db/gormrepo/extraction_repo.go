@@ -99,6 +99,31 @@ func (r *ExtractionRepo) ListSince(ctx context.Context, sinceID int64, limit int
 	return out, nil
 }
 
+// ListByCollection returns documents whose Collection field matches the
+// argument, in id order after sinceID. An empty collection string matches
+// rows whose collection is NULL or empty. limit <= 0 means "no limit".
+func (r *ExtractionRepo) ListByCollection(ctx context.Context, collection string, sinceID int64, limit int) ([]extraction.Document, error) {
+	q := r.DB.R.WithContext(ctx).Model(&ExtractedDocument{}).Where("id > ?", sinceID)
+	if collection == "" {
+		q = q.Where("collection IS NULL OR collection = ''")
+	} else {
+		q = q.Where("collection = ?", collection)
+	}
+	q = q.Order("id ASC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	var ms []ExtractedDocument
+	if err := q.Find(&ms).Error; err != nil {
+		return nil, err
+	}
+	out := make([]extraction.Document, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, *mapExtracted(&m))
+	}
+	return out, nil
+}
+
 func mapExtracted(m *ExtractedDocument) *extraction.Document {
 	d := extraction.Document{
 		ID:                 m.ID,

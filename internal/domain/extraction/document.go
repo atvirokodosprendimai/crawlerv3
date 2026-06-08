@@ -23,4 +23,10 @@ type Repository interface {
 	GetBySource(ctx context.Context, sourceLakeObjectID int64) (*Document, error)
 	GetByID(ctx context.Context, id int64) (*Document, error)
 	ListSince(ctx context.Context, sinceID int64, limit int) ([]Document, error)
+
+	// ListByCollection returns documents whose Collection field equals the
+	// given name, in id order, after sinceID. Used by the rechunk path so
+	// the operator can rebuild every chunk in a collection without scanning
+	// every document. limit <= 0 means "no limit".
+	ListByCollection(ctx context.Context, collection string, sinceID int64, limit int) ([]Document, error)
 }

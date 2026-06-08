@@ -19,17 +19,18 @@ import (
 // downstream chaining (e.g. docx→pdf produces a new lake_objects row + a
 // follow-up pdf_ocr task).
 type TaskSvc struct {
-	Cfg         Config
-	Processing  processing.Repository
-	Lake        lake.Repository
-	Blobs       lake.BlobStore
-	Extractions extraction.Repository
-	Chunks      chunkInserter
-	Lease       *lease.Signer
-	ChunkCfg    chunker.Config
-	Dispatcher  *TriggerDispatcher  // optional; fires EvtBlobProduced on AcceptBlob
-	Resolver    *CollectionResolver // optional; per-domain embed_collection lookup
-	FTS         *FTSSvc             // optional; mirrors extracted text into Quickwit
+	Cfg            Config
+	Processing     processing.Repository
+	Lake           lake.Repository
+	Blobs          lake.BlobStore
+	Extractions    extraction.Repository
+	Chunks         chunkInserter
+	Lease          *lease.Signer
+	ChunkCfg       chunker.Config            // registry-wide defaults; used when ConfigResolver returns no row
+	ConfigResolver *CollectionConfigResolver // optional; per-collection chunk sizing
+	Dispatcher     *TriggerDispatcher        // optional; fires EvtBlobProduced on AcceptBlob
+	Resolver       *CollectionResolver       // optional; per-domain embed_collection lookup
+	FTS            *FTSSvc                   // optional; mirrors extracted text into Quickwit
 }
 
 // chunkInserter is the slice of chunking.Repository TaskSvc needs.
@@ -50,8 +51,12 @@ type chunkRow struct {
 }
 
 // NewTaskSvc wires a TaskSvc with the necessary ports.
-func NewTaskSvc(cfg Config, p processing.Repository, l lake.Repository, b lake.BlobStore, e extraction.Repository, s *lease.Signer) *TaskSvc {
-	return &TaskSvc{Cfg: cfg, Processing: p, Lake: l, Blobs: b, Extractions: e, Lease: s, ChunkCfg: chunker.Defaults()}
+//
+// tok is the chunker tokenizer; stamped onto ChunkCfg at construction.
+func NewTaskSvc(cfg Config, p processing.Repository, l lake.Repository, b lake.BlobStore, e extraction.Repository, s *lease.Signer, tok chunker.Tokenizer) *TaskSvc {
+	cc := chunker.Defaults()
+	cc.Tok = tok
+	return &TaskSvc{Cfg: cfg, Processing: p, Lake: l, Blobs: b, Extractions: e, Lease: s, ChunkCfg: cc}
 }
 
 // AttachChunkSink installs the chunk persistence adapter (kept separate from
@@ -64,6 +69,9 @@ func (t *TaskSvc) SetDispatcher(d *TriggerDispatcher) { t.Dispatcher = d }
 
 // SetResolver wires the per-domain collection resolver.
 func (t *TaskSvc) SetResolver(r *CollectionResolver) { t.Resolver = r }
+
+// SetConfigResolver wires the per-collection chunk-size resolver.
+func (t *TaskSvc) SetConfigResolver(r *CollectionConfigResolver) { t.ConfigResolver = r }
 
 // SetFTS attaches an FTSSvc; AcceptText will mirror the extracted text into
 // Quickwit (after Stanza rewrite if configured). Best-effort, never blocks.
@@ -134,7 +142,15 @@ func (t *TaskSvc) AcceptText(ctx context.Context, in TextResult) error {
 		t.FTS.OnExtracted(ctx, docID, job.LakeObjectID, collection, in.Text)
 	}
 	if t.Chunks != nil && in.Text != "" {
-		pieces := chunker.Split(in.Text, t.ChunkCfg)
+		cfg := t.ChunkCfg
+		if t.ConfigResolver != nil {
+			resolved, _, err := t.ConfigResolver.ResolveConfig(ctx, collection)
+			if err == nil {
+				resolved.Tok = t.ChunkCfg.Tok
+				cfg = resolved
+			}
+		}
+		pieces := chunker.Split(in.Text, cfg)
 		rows := make([]chunkRow, 0, len(pieces))
 		for _, c := range pieces {
 			rows = append(rows, chunkRow{
@@ -142,7 +158,7 @@ func (t *TaskSvc) AcceptText(ctx context.Context, in TextResult) error {
 				DocumentID: docID,
 				ChunkIndex: c.Index,
 				Text:       c.Text,
-				TokenCount: c.WordCount,
+				TokenCount: c.TokenCount,
 			})
 		}
 		if err := t.Chunks.InsertMany(ctx, rows); err != nil {

@@ -79,6 +79,12 @@ type Repository interface {
 	GetContext(ctx context.Context, chunkID string) (*Context, error)
 	RequeueByFilter(ctx context.Context, f RequeueFilter) (int64, error)
 	StatusCounts(ctx context.Context) (map[string]int64, error)
+
+	// ReplaceByDocument deletes every chunk attached to documentID and
+	// inserts the given fresh slice in one WriteTX. Returns the old chunk
+	// IDs so the caller can drive a downstream Qdrant point-delete after
+	// the DB commit lands. Used by the rechunk operator command.
+	ReplaceByDocument(ctx context.Context, documentID int64, fresh []Chunk) (oldIDs []string, err error)
 }
 
 // RequeueFilter selects which chunks to flip back to pending.

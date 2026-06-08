@@ -75,6 +75,7 @@ func runWorker(ctx context.Context, cmd *cli.Command) error {
 		conc:      cmd.Int("concurrency"),
 		idle:      cmd.Duration("idle-sleep"),
 		fetchTO:   cmd.Duration("fetch-timeout"),
+		apiTO:     cmd.Duration("api-timeout"),
 		pageDelay: cmd.Duration("page-delay"),
 		ua:        cmd.String("user-agent"),
 	}
@@ -85,11 +86,12 @@ func runWorker(ctx context.Context, cmd *cli.Command) error {
 		cfg.batch = cfg.conc
 	}
 	cfg.httpc = &http.Client{Timeout: cfg.fetchTO}
-	cfg.apic = &http.Client{Timeout: 30 * time.Second}
+	cfg.apic = &http.Client{Timeout: cfg.apiTO}
 
 	slog.Info("litekoworker started",
 		"registry", cfg.registry, "batch", cfg.batch, "concurrency", cfg.conc,
-		"fetch_timeout", cfg.fetchTO.String(), "page_delay", cfg.pageDelay.String())
+		"fetch_timeout", cfg.fetchTO.String(), "api_timeout", cfg.apiTO.String(),
+		"page_delay", cfg.pageDelay.String())
 
 	jobs := make(chan job, cfg.conc)
 	var wg sync.WaitGroup
@@ -138,6 +140,7 @@ type workerCfg struct {
 	conc      int
 	idle      time.Duration
 	fetchTO   time.Duration
+	apiTO     time.Duration
 	pageDelay time.Duration
 	ua        string
 	httpc     *http.Client
