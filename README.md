@@ -17,7 +17,7 @@ Distributed web crawler + data lake. Central Go registry hands jobs to anonymous
 3. [Install & build](#install--build)
 4. [Quickstart](#quickstart)
 5. [CLI reference](#cli-reference)
-   - [`registry`](#registry) — server, migrations, worker pool, frontier, backfill, triggers
+   - [`registry`](#registry) — server, migrations, worker pool, frontier, backfill, triggers, collections, sweep-now
    - [`worker`](#worker) — reference crawl worker
    - [`taskworker`](#taskworker) — single-kind external processing worker
    - [`ocrworker`](#ocrworker) — dedicated PDF OCR worker (mutool + gs + tesseract page-parallel)
@@ -511,6 +511,16 @@ registry release-worker --id 5
 registry ban-worker --id 5 --release
 # banned worker_id=5
 # released held leases: frontier=3 tasks=1 chunks=2
+
+# Run the frontier lease-expiry sweeper one-shot (don't wait 30s for the next tick).
+registry sweep-now
+# sweep-now released=4
+
+# --force releases EVERY status='leased' frontier row — even unexpired ones.
+# Use after a worker hard-crash left rows in 'leased' that no live worker still
+# owns. Will yank work out from any worker still holding one of those leases.
+registry sweep-now --force
+# sweep-now force-released=12
 ```
 
 Filter semantics:
@@ -519,6 +529,49 @@ Filter semantics:
 - `requeue-chunks` / `requeue-tasks` / `requeue-frontier` **require at least one** of `--status`, `--worker`, plus their queue-specific filter (`--document`, `--processor`, `--domain`). Running them with no filters errors out — refusing to touch the whole table.
 - `release-worker` does not ban; it just clears the leases. Useful when a worker disappears (process crash, network split) and you want its work picked up faster than the 30-second sweep cycle.
 - `ban-worker --release` chains both for the common "this box is broken" case.
+- `sweep-now` only touches `crawl_frontier` (chunk + task sweeps run on the same 30s ticker inside `serve`). Default mode is identical to the ticker (expiry-only). `--force` ignores expiry — only run it when you know no live worker still holds the affected leases.
+
+#### Per-collection chunker config (Phase 3–5)
+
+Every `document_chunks` row carries a `collection` (resolved from `domains.embed_collection`, falling back to the host). Sizing is global by default — **2800 tokens / 400 prev / 400 next**, tokenizer = registry-wide `--tokenizer` (default `cl100k_base`). Override per collection with the `collections` table.
+
+```bash
+# Show overrides. Empty list = every collection uses registry defaults.
+registry list-collections
+# NAME            CHUNK   PREV    NEXT    TOKENIZER
+# lithuania_news  4096    256     256     o200k_base
+
+# Upsert. -1 / "" leaves the field unchanged on an existing row, or seeds the
+# registry defaults on first insert.
+registry set-collection --name lithuania_news \
+                        --chunk-tokens 4096 \
+                        --overlap-prev 256 \
+                        --overlap-next 256 \
+                        --tokenizer    o200k_base
+
+# Bump one knob; the rest keep their stored values.
+registry set-collection --name lithuania_news --overlap-prev 128
+
+# Remove the override; future ingest reverts to registry defaults.
+registry delete-collection --name lithuania_news
+
+# Drop + respit every chunk for a collection at its current sizing config.
+# Use '-' to target documents whose collection is empty (the default bucket).
+# When --qdrant-url is configured, the matching Qdrant points are deleted too;
+# re-embed happens via the normal embed-worker loop on the fresh 'pending' rows.
+registry rechunk --collection lithuania_news --dry-run               # report only
+registry rechunk --collection lithuania_news                         # apply
+registry rechunk --collection lithuania_news --since-doc-id 50000    # incremental
+registry rechunk --collection -                  --limit 1000        # default bucket, capped
+```
+
+Notes:
+
+- Collection config is read at chunk time (pipeline + task workers) and again at `rechunk`. Set the row **before** ingest if you want the first chunk batch sized correctly; otherwise run `rechunk` after.
+- `delete-collection` only drops the override row — existing chunks keep their current sizing until you `rechunk`.
+- `set-collection` is upsert: re-running with `--chunk-tokens` only is safe; `--overlap-prev`, `--overlap-next`, `--tokenizer` keep whatever was stored before.
+- `rechunk` re-reads `extracted_documents.text`, re-runs the chunker, inserts new `document_chunks` rows with `embed_status='pending'`, and (with Qdrant configured) deletes the old points by chunk_id. Per-document output: `doc_id=… chunks_old=N chunks_new=M qdrant_deleted=K`. Summary: `rechunk collection=… mode=applied|dry_run docs=… chunks_old=… chunks_new=… qdrant_deleted=… qdrant_errors=… errors=… config_source=collections-row|defaults chunk_tokens=… overlap_prev=… overlap_next=…`.
+- `--since-doc-id N` skips `document_id <= N` (use to resume a big run); `--limit N` caps document count per invocation.
 
 #### Pipeline triggers (slice 8)
 
