@@ -20,20 +20,34 @@ import (
 // registry crash mid-run leaves documents in either fully-old or fully-new
 // state, never a mix.
 //
-// Qdrant cleanup is deferred to Phase 5: this service returns the list of
-// old chunk IDs per document so a follow-up can delete the corresponding
-// points without recomputing the join.
+// Qdrant cleanup runs after the DB commit lands. Failure to delete stale
+// points is logged but does not roll back the DB — orphan vectors are
+// recoverable (a future sweeper can drop them); partial DB state is not.
+// Wire QdrantDeleter via SetQdrant; leave nil to skip Qdrant entirely.
 type RechunkSvc struct {
 	Extractions extraction.Repository
 	Chunks      chunking.Repository
 	Resolver    *CollectionConfigResolver
 	Defaults    chunker.Config // tokenizer-bearing registry default
+	Qdrant      QdrantDeleter  // optional; nil = skip Qdrant cleanup
 }
 
-// NewRechunkSvc wires the service.
+// QdrantDeleter is the slice of the qdrant client RechunkSvc needs.
+// Declared as a port so the service stays decoupled from the concrete
+// HTTP client (and tests can stub it).
+type QdrantDeleter interface {
+	DeletePoints(ctx context.Context, collection string, ids []string) error
+}
+
+// NewRechunkSvc wires the service. Qdrant cleanup stays off until
+// SetQdrant is called.
 func NewRechunkSvc(e extraction.Repository, c chunking.Repository, r *CollectionConfigResolver, defaults chunker.Config) *RechunkSvc {
 	return &RechunkSvc{Extractions: e, Chunks: c, Resolver: r, Defaults: defaults}
 }
+
+// SetQdrant enables the Qdrant point-delete pass after each per-document
+// DB commit.
+func (s *RechunkSvc) SetQdrant(q QdrantDeleter) { s.Qdrant = q }
 
 // RechunkOpts narrows the work set.
 type RechunkOpts struct {
@@ -44,23 +58,27 @@ type RechunkOpts struct {
 
 // RechunkDoc is one per-document line item.
 type RechunkDoc struct {
-	DocumentID int64
-	OldCount   int
-	NewCount   int
-	OldChunkIDs []string // empty in DryRun
-	Err        error
+	DocumentID     int64
+	OldCount       int
+	NewCount       int
+	OldChunkIDs    []string // empty in DryRun
+	QdrantDeleted  int      // 0 when Qdrant is unwired or DryRun
+	QdrantErr      error    // non-fatal; surfaced for visibility
+	Err            error
 }
 
 // RechunkReport is the aggregate return.
 type RechunkReport struct {
-	Collection   string
-	Config       chunker.Config
-	FromTable    bool
-	Documents    []RechunkDoc
-	TotalOld     int64
-	TotalNew     int64
-	Errors       int
-	DryRun       bool
+	Collection     string
+	Config         chunker.Config
+	FromTable      bool
+	Documents      []RechunkDoc
+	TotalOld       int64
+	TotalNew       int64
+	TotalQdrant    int64
+	QdrantErrors   int
+	Errors         int
+	DryRun         bool
 }
 
 // Rechunk drives the rebuild for one collection name.
@@ -140,6 +158,22 @@ func (s *RechunkSvc) Rechunk(ctx context.Context, collection string, opts Rechun
 			item.OldChunkIDs = oldIDs
 			rep.TotalOld += int64(item.OldCount)
 			rep.TotalNew += int64(item.NewCount)
+
+			// Post-commit Qdrant cleanup. Failure is logged + surfaced via
+			// QdrantErr but never blocks the rechunk run: stale vectors are
+			// recoverable, partial DB state is not.
+			if s.Qdrant != nil && queryColl != "" && len(oldIDs) > 0 {
+				if qerr := s.Qdrant.DeletePoints(ctx, queryColl, oldIDs); qerr != nil {
+					item.QdrantErr = qerr
+					rep.QdrantErrors++
+					slog.WarnContext(ctx, "rechunk: qdrant delete failed",
+						"doc_id", d.ID, "collection", queryColl, "ids", len(oldIDs), "err", qerr)
+				} else {
+					item.QdrantDeleted = len(oldIDs)
+					rep.TotalQdrant += int64(item.QdrantDeleted)
+				}
+			}
+
 			rep.Documents = append(rep.Documents, item)
 			since = d.ID
 		}

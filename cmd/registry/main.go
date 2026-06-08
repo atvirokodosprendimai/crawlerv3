@@ -346,7 +346,6 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 	defaults.Tok = tok
 	cfgResolver := app.NewCollectionConfigResolver(ccrepo, defaults)
 	pipe.SetConfigResolver(cfgResolver)
-	rechunk := app.NewRechunkSvc(erepo, crepo, cfgResolver, defaults)
 	embed := app.NewEmbedSvc(cfg, crepo, signer)
 	tasks := app.NewTaskSvc(cfg, prepo, lrepo, blobs, erepo, signer, tok)
 	tasks.AttachChunkSink(&app.ChunkRepoSink{Repo: crepo})
@@ -362,6 +361,10 @@ func buildService(cmd *cli.Command, db *rwdb.DB) (*registryBundle, error) {
 		Distance: cmd.String("qdrant-distance"),
 	})
 	embed.SetQdrant(qcli)
+	rechunk := app.NewRechunkSvc(erepo, crepo, cfgResolver, defaults)
+	if qcli.Enabled() {
+		rechunk.SetQdrant(qcli)
+	}
 	ecli := embedclient.New(embedclient.Config{
 		BaseURL: cmd.String("embed-url"),
 		Model:   cmd.String("embed-model"),
@@ -1006,7 +1009,12 @@ func actionRechunk(ctx context.Context, cmd *cli.Command) error {
 			fmt.Printf("doc_id=%d ERROR: %v\n", d.DocumentID, d.Err)
 			continue
 		}
-		fmt.Printf("doc_id=%d chunks_old=%d chunks_new=%d\n", d.DocumentID, d.OldCount, d.NewCount)
+		line := fmt.Sprintf("doc_id=%d chunks_old=%d chunks_new=%d qdrant_deleted=%d",
+			d.DocumentID, d.OldCount, d.NewCount, d.QdrantDeleted)
+		if d.QdrantErr != nil {
+			line += fmt.Sprintf(" qdrant_err=%q", d.QdrantErr.Error())
+		}
+		fmt.Println(line)
 	}
 	mode := "applied"
 	if rep.DryRun {
@@ -1016,9 +1024,9 @@ func actionRechunk(ctx context.Context, cmd *cli.Command) error {
 	if rep.FromTable {
 		source = "collections-row"
 	}
-	fmt.Printf("rechunk collection=%s mode=%s docs=%d chunks_old=%d chunks_new=%d errors=%d config_source=%s chunk_tokens=%d overlap_prev=%d overlap_next=%d\n",
+	fmt.Printf("rechunk collection=%s mode=%s docs=%d chunks_old=%d chunks_new=%d qdrant_deleted=%d qdrant_errors=%d errors=%d config_source=%s chunk_tokens=%d overlap_prev=%d overlap_next=%d\n",
 		rep.Collection, mode, len(rep.Documents),
-		rep.TotalOld, rep.TotalNew, rep.Errors,
+		rep.TotalOld, rep.TotalNew, rep.TotalQdrant, rep.QdrantErrors, rep.Errors,
 		source, rep.Config.ChunkTokens, rep.Config.OverlapPrev, rep.Config.OverlapNext)
 	return nil
 }

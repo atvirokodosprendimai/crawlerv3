@@ -21,7 +21,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d -t crawlerv3-smoke-rechunk.XXXXXX)"
-trap 'echo; echo "smoke: workspace kept at $WORK"' EXIT INT TERM
+QDRANT_LOG="$WORK/qdrant-deletes.jsonl"
+QDRANT_PID=""
+cleanup() {
+  [[ -n "$QDRANT_PID" ]] && kill "$QDRANT_PID" 2>/dev/null || true
+  echo
+  echo "smoke: workspace kept at $WORK"
+}
+trap cleanup EXIT INT TERM
 
 DB="$WORK/crawler.db"
 LEASE_SECRET="$(openssl rand -base64 32)"
@@ -31,8 +38,45 @@ cd "$ROOT"
 echo "smoke: building registry"
 go build -o "$WORK/registry" ./cmd/registry
 
+# Fake Qdrant: appends one JSON line per /points/delete POST so we can
+# assert what ids were sent. Returns 200 OK regardless.
+cat > "$WORK/fake_qdrant.py" <<PY
+import http.server, json, os, sys, re
+
+LOG = os.environ["QDRANT_LOG"]
+PORT = int(os.environ.get("QDRANT_PORT", "18083"))
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", "0") or 0)
+        body = self.rfile.read(n) if n else b""
+        rec = {"path": self.path, "body": json.loads(body or b"{}")}
+        with open(LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"result":{"operation_id":1,"status":"completed"},"status":"ok","time":0.0}')
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"result":{"status":"green"},"status":"ok","time":0.0}')
+    def do_PUT(self):
+        self.do_POST()
+
+http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+PY
+
+QDRANT_LOG="$QDRANT_LOG" QDRANT_PORT=18083 python3 "$WORK/fake_qdrant.py" &
+QDRANT_PID=$!
+sleep 0.3
+echo "smoke: fake qdrant on :18083 pid=$QDRANT_PID"
+
 export DB_DSN="$DB"
 export LEASE_SECRET
+export QDRANT_URL="http://127.0.0.1:18083"
 
 echo "smoke: migrate up"
 "$WORK/registry" migrate up >/dev/null
@@ -110,6 +154,31 @@ echo "smoke: idempotence — rechunk again, expect same row count"
 "$WORK/registry" rechunk --collection ut-coll >/dev/null
 TOTAL2=$(sqlite3 "$DB" "SELECT COUNT(*) FROM document_chunks;")
 [[ "$TOTAL2" == "$TOTAL" ]] || { echo "FAIL: second rechunk drifted ($TOTAL2 vs $TOTAL)"; exit 1; }
+
+echo "smoke: qdrant deletes captured"
+if [[ ! -s "$QDRANT_LOG" ]]; then
+  echo "FAIL: fake qdrant received no requests"; exit 1
+fi
+DEL_LINES=$(wc -l < "$QDRANT_LOG" | tr -d ' ')
+echo "  qdrant log lines = $DEL_LINES"
+
+# The first apply replaced 4 stale chunks; assert at least one delete call
+# carrying 'stale-' ids landed at /collections/ut-coll/points/delete.
+STALE_DEL=$(python3 - <<PY
+import json
+hits = 0
+for line in open("$QDRANT_LOG"):
+    rec = json.loads(line)
+    if "/collections/ut-coll/points/delete" not in rec["path"]:
+        continue
+    ids = rec["body"].get("points", [])
+    if any(str(x).startswith("stale-") for x in ids):
+        hits += 1
+print(hits)
+PY
+)
+[[ "$STALE_DEL" -ge 1 ]] || { echo "FAIL: no points/delete carrying stale-* ids reached qdrant"; exit 1; }
+echo "  stale-id delete calls = $STALE_DEL"
 
 echo
 echo "smoke: OK"

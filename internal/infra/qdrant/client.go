@@ -96,6 +96,32 @@ func (c *Client) Upsert(ctx context.Context, collection string, points []Point) 
 	return nil
 }
 
+// DeletePoints removes points by id. Used by the rechunk path to drop
+// vectors that pointed at chunks the operator just replaced.
+//
+// Behavior contract:
+//   - Disabled client (no qdrant URL) → no-op, returns nil.
+//   - Empty ids → no-op, returns nil.
+//   - Qdrant returns 404 for a missing collection — treated as a no-op
+//     rather than an error, because rechunk runs against arbitrary
+//     collection names and only some have a Qdrant counterpart wired up.
+//   - Any other non-2xx is surfaced as an error.
+func (c *Client) DeletePoints(ctx context.Context, collection string, ids []string) error {
+	if !c.Enabled() || len(ids) == 0 {
+		return nil
+	}
+	body := map[string]any{"points": ids}
+	status, _, err := c.do(ctx, "POST", "/collections/"+collection+"/points/delete?wait=true", body)
+	if err == nil {
+		return nil
+	}
+	if status == 404 {
+		// Collection doesn't exist on this Qdrant — nothing to clean up.
+		return nil
+	}
+	return fmt.Errorf("qdrant delete %q: %w", collection, err)
+}
+
 // SearchHit is one search result.
 type SearchHit struct {
 	ID      string         `json:"id"`

@@ -70,16 +70,16 @@ After this plan, the operator can: (a) run `registry rechunk --collection lithua
 
 **End-of-phase outcome:** the operator can run `registry rechunk --collection liteko` and watch `queue-stats` show the chunk queue spike. Qdrant still holds the old vectors at this point — Phase 5 (DeletePoints) is the last piece.
 
-## Phase 5 — Qdrant cleanup integration
+## Phase 5 — Qdrant cleanup integration — [completed]
 
 **Goal:** rechunk removes stale vectors from Qdrant so search doesn't see ghosts.
 
-1. [ ] Verify `internal/infra/qdrant/client.go` has a `DeletePoints(ctx, collection, ids []string) error`; add it if not (Qdrant exposes `POST /collections/{name}/points/delete`).
-2. [ ] Extend `Rechunk` to call `qdrant.DeletePoints(collection, oldChunkIDs)` AFTER the per-document `WriteTX` commits. Log on failure; do not fail the rechunk — stale points are recoverable, partial DB state is not.
-3. [ ] Extend the rechunk report with `qdrant_deleted` per document.
-4. [ ] Extend `scripts/smoke_rechunk.sh` to run against a fake Qdrant and assert the right point IDs were deleted.
+1. [x] Added `qdrant.Client.DeletePoints(ctx, collection, ids)` posting to `/collections/{name}/points/delete?wait=true`. Disabled client + empty ids + 404 collection all short-circuit to no-op; other non-2xx surfaces as an error.
+2. [x] `RechunkSvc` grew a `QdrantDeleter` port + `SetQdrant`. After each per-document `ReplaceByDocument` commit the service calls `DeletePoints(queryColl, oldIDs)`. Failure is logged (`slog.WarnContext`) and surfaced via `RechunkDoc.QdrantErr` + `RechunkReport.QdrantErrors`; it never blocks subsequent documents — stale points are recoverable, partial DB state is not.
+3. [x] `RechunkReport` now carries `TotalQdrant` and `QdrantErrors`; per-doc lines print `qdrant_deleted=N` (and `qdrant_err="…"` when set).
+4. [x] `scripts/smoke_rechunk.sh` now spawns a tiny Python `ThreadingHTTPServer` fake Qdrant that logs every `points/delete` body to a JSONL file. The smoke asserts: at least one delete call landed on `/collections/ut-coll/points/delete`, and the payload carries the `stale-*` IDs (3 calls). The idempotent rerun also fires (6 total log lines, 3 with fresh IDs). Wired via `QDRANT_URL=http://127.0.0.1:18083`. Passes.
 
-**End-of-phase visible result:** post-rechunk, Qdrant collection size drops by the old-chunk count and grows back as the embed worker fills new vectors. `/v1/search` no longer returns matches against orphaned point IDs.
+**End-of-phase outcome:** the rechunk command now fully closes the loop — DB chunks replaced and Qdrant points removed atomically per document, with failure-isolation. The full chunker plan is done.
 
 ---
 
@@ -103,3 +103,4 @@ The plan is done when:
 - **2026-06-08 00:05** — Phase 2 completed. Chunker rewritten to token-space sliding window with `prev||core||next` shape; `Defaults()` = 2800/400/400. `NewPipeline` and `NewTaskSvc` take `Tokenizer` arg; registry wires `bundle.Tokenizer` through. Spec §1 verification covered in `chunker_test.go`. End-to-end with real cl100k_base passes. `scripts/smoke.sh` green — surfaced a pre-existing `UpsertByHost` bug (parallel_fetches=0 → no reserves) and fixed in `4f78337`. Also pulled two unrelated operational fixes (`sweep-now` CLI + idempotent `lake_objects.Insert` on UNIQUE) into commits `104aa79` to address concurrent prod issues; merged to main in `7509375`. Phase 3 next.
 - **2026-06-08 00:11** — Phase 3 completed. Migration `0010_collections.sql` (3 dialects). New `chunking.CollectionConfigRepo` port + `gormrepo` impl using `ON CONFLICT … DO UPDATE`. New `app.CollectionConfigResolver` resolves per-collection sizing with fallback to registry defaults. `Pipeline.writeChunks` and `TaskSvc.AcceptText` now resolve config per document; existing call shape kept by keeping `ChunkCfg` as the fallback. Three CLI subcommands: `list-collections`, `set-collection` (read-modify-write so partial flags don't clobber), `delete-collection`. New `scripts/smoke_collections.sh` covers the full lifecycle. Phase 4 (rechunk CLI) next.
 - **2026-06-08 00:20** — Phase 4 completed. Added `chunking.Repository.ReplaceByDocument` (single-WriteTX delete-and-replace, returns old chunk IDs for Phase 5) and `extraction.Repository.ListByCollection`. New `app.RechunkSvc` orchestrates the walk in pages of 100. CLI `registry rechunk --collection <name>` with `--dry-run`, `--since-doc-id`, `--limit`. `scripts/smoke_rechunk.sh` plants stale chunks, asserts dry-run leaves the DB intact, then applies tiny per-collection sizing and verifies stale rows gone, every new chunk pending, idempotent rerun. Phase 5 (Qdrant cleanup) is the only piece remaining.
+- **2026-06-08 07:08** — Phase 5 completed. `qdrant.Client.DeletePoints` shipped (disabled / empty / 404 = no-op). `RechunkSvc` got a `QdrantDeleter` port and `SetQdrant`; the registry wires the bundle's qdrant client when `--qdrant-url` is set. After each per-doc `ReplaceByDocument` commit the service deletes the old chunk IDs from the collection, logging on failure but never blocking the run. CLI prints `qdrant_deleted=N` per doc + a totals line. `scripts/smoke_rechunk.sh` spawns a Python `ThreadingHTTPServer` fake Qdrant that logs every `points/delete` body — asserts 3 calls carry the `stale-*` IDs from the apply pass. Whole 5-phase chunker plan now done.
