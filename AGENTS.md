@@ -636,3 +636,38 @@ The Git log on `task/slice-NN-*` branches preserves the exact diffs.
 5. **Read the relevant migration before changing the schema.** Often the columns you need already exist.
 
 Welcome aboard.
+
+---
+
+## 18. Architecture Decision Records (ADRs)
+
+The `ADR/` folder at the repo root holds the load-bearing design decisions and the reasoning behind them. AGENTS.md tells you **what** the conventions are; ADRs tell you **why** — and what trade-offs you'd be reopening if you changed them.
+
+Read the relevant ADR before:
+
+- Proposing a structural change (new layer, new cross-cutting concern, replacing a port).
+- Reopening a trade-off ("can we just use gorm in domain?", "do we really need three migration dirs?", "why HMAC not JWT?").
+- Adding a new component that resembles an existing one — confirm you're following the same pattern, not inventing a parallel one.
+
+Current ADRs (see `ADR/README.md` for the live index):
+
+| # | Title |
+|---|---|
+| 0001 | DDD + ports & adapters layout |
+| 0002 | CQRS via `rwdb` — single writer, many readers |
+| 0003 | Capability strings for authz + routing |
+| 0004 | HMAC stateless lease tokens |
+| 0005 | Declarative `pipeline_triggers` |
+| 0006 | Multi-dialect SQL via Goose migrations |
+| 0007 | HTTP polling protocol: reserve → lease → result/fail |
+| 0008 | Internal vs external processors split |
+| 0009 | Token-sized chunks + per-collection chunker config |
+| 0010 | Smoke shell scripts as primary test layer |
+
+**When to add a new ADR.** Any time you make a decision that:
+
+1. A future contributor (human or agent) is likely to question or try to undo without context.
+2. Affects more than one slice / subsystem.
+3. Locks in a trade-off (perf vs flexibility, type-safety vs operator-runtime-configurability, etc.).
+
+Format and process: see `ADR/README.md`. Keep them short — the decision matters, the prose doesn't.
